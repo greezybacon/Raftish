@@ -32,7 +32,7 @@ class StoreClient:
         self.reader, self.writer = server
 
     async def request(self, cmd, *args):
-        send_message(self.writer, pickle.dumps((cmd, *args)))
+        send_message(self.writer, (cmd, *args))
         return await receive_message(self.reader)
 
     async def do_get(self, key):

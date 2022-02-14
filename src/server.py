@@ -58,7 +58,7 @@ async def kvserver(host='localhost', port=12347):
         try:
             while True:
                 message = await receive_message(reader)
-                cmd_name, *args = pickle.loads(message)
+                cmd_name, *args = message
                 try:
                     cmd = locals()['do_' + cmd_name]
                     send_message(writer, await cmd(*args))
