@@ -22,7 +22,7 @@ lights = {
 
 buttons = {
     'East-West':    ('localhost', 17000),
-    'North-South':  ('localhost', 17001),
+    'North-South':  ('localhost', 17000),
 }
 
 states = [
@@ -58,7 +58,7 @@ def controller(queue, states):
     log = logging.getLogger('traffic.controller')
 
     # Setup button inputs
-    for name, target in buttons.items():
+    for target in set(buttons.values()):
         threading.Thread(target=await_button, args=(queue, target), daemon=True).start()
 
     # Start the clock
