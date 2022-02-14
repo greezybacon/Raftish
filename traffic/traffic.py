@@ -26,9 +26,9 @@ buttons = {
 }
 
 states = [
-    (30, {'North-South': 'G', 'East-West': 'R'}, ('North-South', 15)),
+    (30, {'North-South': 'G', 'East-West': 'R'}, ('East-West', 15)),
     (5, {'North-South': 'Y', 'East-West': 'R'}, False),
-    (60, {'North-South': 'R', 'East-West': 'G'}, ('East-West', 15)),
+    (60, {'North-South': 'R', 'East-West': 'G'}, ('North-South', 15)),
     (5, {'North-South': 'R', 'East-West': 'Y'}, False),
 ]
 
@@ -94,10 +94,11 @@ def controller(queue, states):
                     log.warning(f"Recieved unhandled event: {event}")
             
                 # Handle button press for the current green light
-                if green_light and button_pressed[green_light]:
-                    if minimum is not False:
-                        button, min_time = minimum
-                        if green_light == button and time > min_time:
+                if minimum is not False:
+                    red_req_button, min_time = minimum
+                    if green_light and button_pressed[red_req_button]:
+                        if green_light != red_req_button and ticks > min_time:
+                            log.info("Changing light because of button press")
                             break
 
 if __name__ == '__main__':
