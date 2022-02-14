@@ -37,8 +37,8 @@ async def echoserver_upper(host='localhost', port=12346):
 
 from store import KeyValueStore
 import pickle
-async def kvserver(host='localhost', port=12347):
-    store = KeyValueStore("/tmp/kvstore.db")
+async def kvserver(host='localhost', port=12347, db_path="/tmp/kvstore.db"):
+    store = KeyValueStore(db_path)
 
     async def handler(reader, writer):
         async def do_get(key):

@@ -9,6 +9,9 @@ class ShelfStore:
         else:
             self.store = shelve.Shelf({}, writeback=False)
 
+    async def save(self):
+        return await asyncio.to_thread(self.store.sync)
+
     def get(self, name):
         return self.store[name]
 

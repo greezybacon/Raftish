@@ -43,13 +43,18 @@ class StoreClient:
         else:
             print(f"{key} not in the store")
 
+        return response
+    get = do_get
+
     async def do_set(self, key, value):
         response = await self.request('set', key, value)
         print(response)
+    set = do_set
 
     async def do_del(self, key):
         response = await self.request('del', key)
         print(response)
+    delete = do_del
 
     async def cmdloop(self):
         print(self.intro)
