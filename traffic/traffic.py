@@ -28,8 +28,8 @@ buttons = {
 states = [
     (30, {'North-South': 'G', 'East-West': 'R'}, ('North-South', 15)),
     (5, {'North-South': 'Y', 'East-West': 'R'}, False),
-    (60, {'North-South': 'R', 'East-West': 'G'}, ('East-West', 45)),
-    (5, {'North-South': 'G', 'East-West': 'Y'}, False),
+    (60, {'North-South': 'R', 'East-West': 'G'}, ('East-West', 15)),
+    (5, {'North-South': 'R', 'East-West': 'Y'}, False),
 ]
 
 def clock(queue, tick=1):
@@ -74,28 +74,30 @@ def controller(queue, states):
                 for name in buttons.keys()
             }
 
-            green_light = None
-
             # Update lights with new state
+            green_light = None
             for name, state in light_states.items():
                 set_light(name, state)
                 if state == 'G':
                     green_light = name
 
             # Await transition to next state
-            while time > 0:
+            ticks = 0
+            while ticks < time:
                 event, *args = queue.get()
                 if event == 'clock':
-                    time -= 1
+                    ticks += 1
                 elif  event == 'button':
                     name = args[0]
                     button_pressed[name] = True
+                else:
+                    log.warning(f"Recieved unhandled event: {event}")
             
                 # Handle button press for the current green light
                 if green_light and button_pressed[green_light]:
                     if minimum is not False:
                         button, min_time = minimum
-                        if green_light == button and time < min_time:
+                        if green_light == button and time > min_time:
                             break
 
 if __name__ == '__main__':
