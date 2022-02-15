@@ -32,15 +32,6 @@ def step_impl(context, n, term):
     prev_index = context.log.previousIndex
     return add_entry_with_term_and_index(context, n, term, prev_index)
 
-@then('lastApplied == {state}')
-def step_impl(context, state):
-    print(context.log.lastApplied)
-    assert context.log.lastApplied == int(state)
-
-@then('commitIndex == {state}')
-def step_impl(context, state):
-    assert context.log.commitIndex == int(state)
-
 @then('appendResult == {result}')
 def step_impl(context, result):
     print(context.last_append, result)
@@ -48,4 +39,5 @@ def step_impl(context, result):
 
 @then('there are {n} items in the log')
 def step_impl(context, n):
+    print(len(context.log))
     assert len(context.log) == int(n)

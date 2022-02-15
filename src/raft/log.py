@@ -46,14 +46,21 @@ class TransactionLog:
             # Bogus index number
             return False
 
-        if previousIndex + 1 < len(self._log):
-            # Truncate the log after the last index
-            del self._log[previousIndex+1:]
+        if len(entries) > 0:
+            # If there are existing log entries at the specified position, but
+            # they are from a different term, then the existing entry and
+            # everything that follows it needs to be deleted.
+            if previousIndex + 1 < len(self._log):
+                if self._log[previousIndex+1].term != entries[0].term:
+                    # Truncate the log after the last index
+                    del self._log[previousIndex+1:]
+                else:
+                    # Same index and term -- simple replacement?
+                    pass
 
-        self._log[previousIndex+1:previousIndex+1+len(entries)] = entries
-        self.lastApplied = len(self._log) - 1
+            self._log[previousIndex+1:previousIndex+1+len(entries)] = entries
 
-        # TODO: Commit to disk
+            # TODO: Commit to disk
 
         return True
 
@@ -85,12 +92,13 @@ class TransactionLog:
         # It is safe to apply this index into the application. This is called
         # from the concensus backend. The local server
         assert self.commitIndex < entry.index
+        assert self.lastApplied < entry.index
 
         # TODO: If entry.index > lastApplied, then apply all items in the
         # transaction log up to entry.index
 
         with self.application_lock:
-            self.commitIndex = entry.index
+            self.lastApplied = entry.index
 
             await asyncio.gather(*(
                 cb(entry)
