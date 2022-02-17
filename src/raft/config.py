@@ -1,5 +1,6 @@
 import json
 import os, os.path
+import shutil
 
 from .exception import ConfigurationError
 
@@ -9,20 +10,23 @@ class ClusterConfig:
     used for message passing and such.
     """
     default_config = {
-        "storage_path": "/tmp/raft_cluster/",
+        #"storage_path": "/tmp/raft_cluster/",
+        "election_timeout": 3,
+        "broadcast_timeout": 0.5,
         "nodes": [
             {
-                "id": "server1",
-                "hostname": "localhost",
-                "listen": "0.0.0.0",
-                "port": 10000,
+                "id": "server1",                # Used in cluster comm
+                "hostname": "localhost",        # External name
+                "listen": "0.0.0.0",            # Bind address
+                "port": 10000,                  # Bind port
+                "app_address": "hostname:port"  # Redirect if not leader
             },
         ],
     }
 
     def __init__(self, local_id, json):
         self.local_id = local_id
-        self.config = json
+        self.config = dict(self.default_config, **json)
 
     @classmethod
     def from_json(self, local_id, json):
@@ -55,6 +59,17 @@ class ClusterConfig:
             return self.config['storage_path']
 
         path = f'/tmp/raft_node_{self.local_id}'
-        os.makedirs(path, exist_ok=True)
+        if os.path.exists(path):
+            shutil.rmtree(path)
+
+        os.mkdir(path)
 
         return path
+
+    @property
+    def election_timeout(self):
+        return self.config['election_timeout']
+
+    @property
+    def broadcast_timeout(self):
+        return self.config['broadcast_timeout']

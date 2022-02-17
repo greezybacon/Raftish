@@ -75,23 +75,32 @@ async def step_impl(context, n, term):
 @when('the leader has replicated its logs to all nodes')
 @async_step
 async def step_impl(context):
-    await asyncio.sleep(0.06)
+    await asyncio.sleep(0.10)
 
 @then('the last entry in all nodes is ({term}, {index})')
 @async_step
 async def step_impl(context, term, index):
-    await asyncio.sleep(0.08)
+    await asyncio.sleep(0.06)
     for server in context.servers:
         entry = server.log.lastEntry
         assert entry
-        print(term, server.log._log)
+        print(term, server.log)
         assert entry.term == int(term)
         assert server.log.lastIndex == int(index)
 
-@then(u'all nodes will have log with terms "{terms}"')
+@then('all nodes will have log with terms "{terms}"')
 def step_impl(context, terms):
     terms = [int(n) for n in terms.split(",")]
     for server in context.servers:
-        print(list(zip(terms, server.log._log)))
-        for term, entry in zip(terms, server.log._log):
+        print(server.log, terms)
+        for term, entry in zip(terms, server.log):
             assert term == entry.term
+        assert len(server.log) == len(terms) 
+
+@then('the cluster will have a leader')
+def step_impl(context):
+    for server in context.servers:
+        if server.is_leader():
+            break
+    else:
+        assert False, "No node in the cluster is a leader"

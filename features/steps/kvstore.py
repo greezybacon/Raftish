@@ -1,11 +1,3 @@
-import os, os.path
-import sys
-
-base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-src_base = os.path.join(base, 'src')
-if src_base not in sys.path:
-    sys.path.append(src_base)
-
 import asyncio
 from behave import given, when, then
 from behave.api.async_step import async_run_until_complete as async_step
@@ -60,7 +52,6 @@ def step_impl(context, key, value):
 # Server API components
 from server import kvserver
 from client import StoreClient
-import threading
 
 @given('a kv server')
 @async_step

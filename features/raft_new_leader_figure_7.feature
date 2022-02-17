@@ -24,3 +24,15 @@ Feature: Cluster can recover from the state in Figure 7
              And an log entry with "test-content" is added to the cluster log
              And the leader has replicated its logs to all nodes
             Then all nodes will have log with terms "1,1,1,4,4,5,5,6,6,8"
+        
+        Scenario: Node 3, if elected will replicate its log
+            When node 3 becomes the leader for term 8
+             And an log entry with "test-content" is added to the cluster log
+             And the leader has replicated its logs to all nodes
+            Then all nodes will have log with terms "1,1,1,4,4,5,5,6,6,6,6,8"
+
+        Scenario: Node 4, if elected will replicate its log
+            When node 4 becomes the leader for term 8
+             And an log entry with "test-content" is added to the cluster log
+             And the leader has replicated its logs to all nodes
+            Then all nodes will have log with terms "1,1,1,4,4,5,5,6,6,6,7,7,8"

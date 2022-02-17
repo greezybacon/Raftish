@@ -1,38 +1,55 @@
 import asyncio
 from dataclasses import dataclass
+from itertools import count
 import os, os.path
 import pickle
 
 import logging
 log = logging.getLogger('raft.log')
 
-class TransactionLog:
+class TransactionLog(list):
+    """
+    The main thing in Raft. The transation log is replicated to all servers in
+    the cluster and is guaranted to be exactly the same as the version on the
+    current leader.
+
+    LogEntry items are appended to the log. Subsequently, the server will
+    indicate that a certain log index is considered "committed" which means it
+    is safe to apply it to the application state machine locally. To do this,
+    the application implementing Raft will need to register a callback via the
+    ::add_apply_callback method. The callback will be called and supplied with
+    the LogEntry instance of each and every LogEntry which gets
+    applied/committed.
+
+    Entries in the log are 1-based. 0 represents the index of an empty log, 1
+    represents the first items and so on.
+    """
     def __init__(self, disk_path):
         self.disk_path = os.path.join(disk_path or '.', 'transcation_log')
-        self.lastApplied = -1
+        self.lastApplied = 0
         self.apply_callbacks = set()
-        self.apply_evet = asyncio.Event()
+        self.apply_event = asyncio.Event()
         self.application_lock = asyncio.Lock()
         self.load()
 
     def load(self):
         try:
             with open(self.disk_path, 'rb') as logfile:
-                self._log = pickle.load(logfile)
+                self.extend(pickle.load(logfile))
         except FileNotFoundError:
-            self._log = []
+            pass
 
     def save(self):
         try:
             # XXX: Maybe background, but ensure _log is not modified in the mean
             # time?
             with open(self.disk_path, 'wb') as logfile:
-                pickle.dump(self._log, logfile)
+                pickle.dump(self, logfile)
         except IOError:
             raise
 
     def append(self, entry):
-        if len(self._log):
+        if len(self):
             term = self.lastEntry.term
         else:
             term = 0
@@ -43,12 +60,12 @@ class TransactionLog:
         return False
 
     def append_entries(self, entries, previousIndex=None, previousTerm=None):
-        if previousIndex >= len(self._log):
+        if previousIndex > len(self):
             # Gap
             return False
 
-        if previousIndex >= 0:
-            previous_entry = self._log[previousIndex]
+        if previousIndex > 0:
+            previous_entry = self.get(previousIndex)
             if previous_entry.term != previousTerm:
                 # Log does not match and cannot be appended
                 return False
@@ -56,7 +73,7 @@ class TransactionLog:
                 # Term mismatch
                 return False
 
-        elif previousIndex < -1:
+        elif previousIndex < 0:
             # Bogus index number
             return False
 
@@ -64,16 +81,19 @@ class TransactionLog:
             # If there are existing log entries at the specified position, but
             # they are from a different term, then the existing entry and
             # everything that follows it needs to be deleted.
-            if previousIndex + 1 < len(self._log):
-                if self._log[previousIndex+1].term != entries[0].term:
-                    # Truncate the log after the last index
-                    log.warning(f"Truncating log entries after {previousIndex+1}")
-                    del self._log[previousIndex+1:]
-                else:
-                    # Same index and term -- simple replacement?
-                    pass
+            if previousIndex < len(self):
+                for index, entry in zip(count(previousIndex), entries):
+                    # NOTE This is checking for REPLACING an entry which would
+                    # mean to check the entry AFTER the previousIndex
+                    if self.get(index).term != entry.term:
+                        # Truncate the log after the last index
+                        log.warning(f"Truncating log entries after {previousIndex}")
+                        del self[previousIndex:]
+                        break
 
-            self._log[previousIndex+1:previousIndex+1+len(entries)] = entries
+                # else: Same index and term -- simple replacement?
+
+            self[previousIndex:previousIndex+len(entries)] = entries
 
             # TODO: Commit to disk
 
@@ -84,10 +104,7 @@ class TransactionLog:
 
     @property
     def lastIndex(self):
-        try:
-            return len(self._log) - 1
-        except IndexError:
-            return -1 
+        return len(self)
 
     @property
     def previousTerm(self):
@@ -98,33 +115,37 @@ class TransactionLog:
 
     @property
     def lastEntry(self):
-        if len(self._log) == 0:
+        if len(self) == 0:
             return None
 
-        return self._log[self.lastIndex]
+        return self[-1]
 
-    def since(self, index, max_entries=100):
+    def since(self, index, max_entries=10):
         # Start at the lesser of the requested ID and the last appended index
-        start = min(index+1, self.lastIndex)
-
+        start = min(index, self.lastIndex)
         # Stop at the lesser of MAX_ENTRIES from the end of the log
-        stop = min(start + max_entries, self.lastIndex+1)
-        return self._log[start:stop]
+        stop = min(start + max_entries, self.lastIndex)
+        # index is 1-based, so no need to add one
+        return self[start:stop]
+
+    def get(self, index):
+        return self[index-1]
 
     def entryBefore(self, index):
         start = min(index, self.lastIndex)
         if start < 0:
             return None
 
-        return self._log[start]
-
+        return self.get(start - 1)
 
     def add_apply_callback(self, callback):
         self.apply_callbacks.add(callback)
 
     async def apply_up_to(self, index):
+        # Can't apply past the end of the local log
+        assert index <= self.lastIndex
         while self.lastApplied < index:
-            if not self.apply(self.lastApplied):
+            if not await self.apply(self.lastApplied + 1):
                 return False
 
         return True
@@ -132,22 +153,22 @@ class TransactionLog:
     async def apply(self, index):
         # It is safe to apply this index into the application. This is called
         # from the concensus backend. The local server
-        assert self.commitIndex < entry.index
-        assert self.lastApplied < entry.index
+        assert self.lastApplied < index
 
         # TODO: If entry.index > lastApplied, then apply all items in the
         # transaction log up to entry.index
 
-        with self.application_lock:
-            entry = self._log[index]
-
+        async with self.application_lock:
+            entry = self[index-1]
+            # XXX: If the apply fails for someone, then it will be resent for
+            # everyone, which is probably outside the scope/intention of Raft.
             if not all(await asyncio.gather(*(
                     cb(entry)
                     for cb in self.apply_callbacks
                 ))):
                 return False
 
-            self.lastApplied = entry.index
+            self.lastApplied = index
 
             # XXX: Timeout?
 
@@ -155,12 +176,6 @@ class TransactionLog:
         self.apply_event.clear()
 
         return True
-
-    def __len__(self):
-        return len(self._log)
-
-    def __getitem__(self, index):
-        return self._log[index]
 
 @dataclass
 class LogEntry:

@@ -1,15 +1,14 @@
 import asyncio
-from re import X
 from typing import Type
 import asyncio_dgram
 from dataclasses import dataclass
-from enum import Enum
 import os, os.path
 import pickle
 
-from .exception import NewTermError
+from .exception import NewTermError, DeadlockError
 from .log import TransactionLog
 from .messages import Message, Response
+from .util import wait_for
 
 import logging
 log = logging.getLogger('raft.server')
@@ -68,18 +67,22 @@ class LocalServer:
 
     def shutdown(self):
         self.role_task.cancel()
-        self.socket.close()
         for task in self.comm_tasks:
             task.cancel()
+        self.socket.close()
 
     # Follower Protocol ------
         
     async def become_follower(self):
         await self.switch_role(FollowerRole)
-        # TODO: Start ::handle_messages and Add done callback to cancel
-        # ::handle_messages when changing from Follower role.
+
+    def is_follower(self):
+        return type(self.role) is FollowerRole
         
     async def switch_role(self, new_role):
+        if type(self.role) is new_role:
+            return
+
         if hasattr(self, 'role_task'):
             self.role_task.cancel()
 
@@ -93,8 +96,14 @@ class LocalServer:
                 log.info(f"Switching to {next_role} role")
                 self.role = next_role(self)
                 next_role = await self.role.initiate()
+                if next_role is None:
+                    log.warning("Potential deadlock. Role task returned byt did not specify the next role")
+                    break
+                    #raise DeadlockError("Role task returned but did not specify next role")
         except asyncio.CancelledError:
-            self.role = None
+            pass
+
+        self.role = None
 
     @property
     def commitIndex(self):
@@ -105,18 +114,31 @@ class LocalServer:
         assert value >= self._commitIndex
         self._commitIndex = value
 
+    async def advanceCommitIndex(self, index):
+        # Ensure the commit index doesn't advance past the end of the log
+        index = min(self.log.lastIndex, index)
+        self.commitIndex = index
+        await self.log.apply_up_to(index)
+
+    @property
+    def hasVoted(self):
+        return self.config.hasVoted
+
+    def voteFor(self, term, candidate):
+        assert not self.config.hasVoted
+        self.config.voteFor(term, candidate)
+
     # Candidate Protocol ------
 
     def is_candidate(self):
         return type(self.role) is CandidateRole
 
     @property
-    def term(self):
+    def currentTerm(self):
         return self.config.currentTerm
-    currentTerm = term
 
     def incrementTerm(self):
-        return self.config.incrementTerm()
+        return self.config.incrementCurrentTerm()
 
     # Leader Protocol ------
 
@@ -133,6 +155,7 @@ class LocalServer:
         lastId = self.log.append(entry)
         if lastId is not False:
             # Tickle the append_event for anyone listening
+            log.info("Signalling the append_event")
             self.append_event.set()
             self.append_event.clear()
 
@@ -173,8 +196,6 @@ class LocalServer:
         except asyncio.CancelledError:
             # Server is shutting down
             pass
-        except asyncio_dgram.aio.TransportClosed:
-            pass
             
     async def handle_messages(self):
         # Messages will be handled here when the server is a follower. In
@@ -182,35 +203,37 @@ class LocalServer:
         # send and receive messages.
         try:
             while True:
+                response = False
                 try:
                     message, sender = await self.in_queue.get()
                     response = await self.role.handle_message(message, sender)
-                    if response:
-                        await response.send(self.socket, sender)
                 except NewTermError as e:
                     # The incoming message indicates a new sherrif in town. Demote
                     # to follower
                     self.config.currentTerm = e.term
-                    await self.switch_role(FollowerRole)
+                    if not self.is_follower():
+                        await self.switch_role(FollowerRole)
+                    else:
+                        # Try the message again with the new term
+                        response = await self.role.handle_message(message, sender)
+                finally:
+                    if response:
+                        await response.send(self.socket, sender)
         except asyncio.CancelledError:
             # Server is shutting down
             pass
         except:
             log.exception("oops")
 
-@dataclass
-class PersistentState:
-    term:       int
-    votedFor:   str
-
 class LocalState:
     """
     Represents the disk-backed properties of the local system as required by Raft.
     """
-    default_config = PersistentState(
-        term = 1,
-        votedFor = None,
-    )
+
+    @dataclass
+    class PersistentState:
+        term:       int = 1
+        votedFor:   str = None
 
     def __init__(self, disk_path):
         self.disk_path = os.path.join(disk_path, "local_state")
@@ -221,7 +244,7 @@ class LocalState:
             with open(self.disk_path, 'rb') as config_file:
                 self._config = pickle.load(config_file)
         except (FileNotFoundError, EOFError):
-            self._config = self.default_config
+            self._config = self.PersistentState()
 
     # Disk-backed state
 
@@ -231,54 +254,61 @@ class LocalState:
 
     @currentTerm.setter
     def currentTerm(self, value):
+        assert value >= self._config.term
         self._config.term = value
+        self._config.votedFor = None
         self._sync()
 
     def incrementCurrentTerm(self):
-        self._config.term += 1
+        self.currentTerm = self.currentTerm + 1
+
+    def voteFor(self, term, serverId):
+        assert term >= self._config.term
+        self._config.term = term
+        self._config.votedFor = serverId
         self._sync()
 
     @property
-    def votedFor(self):
-        return self._config.votedFor
-
-    @votedFor.setter
-    def votedFor(self, serverId):
-        self._config.votedFor = serverId
-        self._sync()
+    def hasVoted(self):
+        return self._config.votedFor is not None
 
     def _sync(self):
         # Commit state to disk
         with open(self.disk_path, 'wb') as config_file:
             pickle.dump(self._config, config_file)
 
-@dataclass
-class RemoteState:
-    nextIndex: int
-    matchIndex: int
 
 class RemoteServer:
     """
     Represents all the other servers in the cluster which are not this one/the
     local one.
     """
+    @dataclass
+    class State:
+        nextIndex: int  = 0
+        matchIndex: int = 0 
+
     def __init__(self, id, hostname, port):
         self.id = id
         self.address = (hostname, port)
+        self.state = self.State()
 
     async def start(self, server):
         self.out_queue = server.out_queue
         self.in_queue = asyncio.Queue()
 
-    async def transceive(self, message):
+    async def transceive(self, message, timeout=None):
         await self.out_queue.put((message, self.address))
-        response = await self.in_queue.get()
+        response = await wait_for(self.in_queue.get(), timeout=timeout)
 
         assert(type(response) in (None, message.Response))
         return response
 
-    async def receive(self):
-        return await self.in_queue.get()
+    async def receive(self, timeout=None):
+        return await self.in_queue.get(timeout=timeout)
+
+    def __repr__(self):
+        return f"<Server: ({self.id}) @ {self.address}>"
 
 # Circular imports
 from .role import CandidateRole, FollowerRole, LeaderRole, Role

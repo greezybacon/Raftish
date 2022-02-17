@@ -1,4 +1,5 @@
 class ConfigurationError(Exception): pass
+class DeadlockError(Exception): pass
 class NotALeader(Exception): pass
 
 class NewTermError(Exception):

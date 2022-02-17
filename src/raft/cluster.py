@@ -11,6 +11,7 @@ class Cluster:
     def __init__(self, config):
         self.config = config
         self.local_id = config.local_id
+        self.leaderId = None
         self.setup()
 
     @classmethod
@@ -35,14 +36,14 @@ class Cluster:
         return self._remote_servers
 
     def lastCommitIndex(self):
-        nextIndexes = [x.state.nextIndex for x in self.remote_servers]
+        matchIndexes = [x.state.matchIndex for x in self.remote_servers]
         # Find the nextIndex number that the majority of the systems are greater
         # than. To find that, sort the list and take the ::quorum_count item
         majority = self.quorum_count
-        if len(nextIndexes) < majority:
+        if len(matchIndexes) < majority:
             return 0
 
-        return sorted(nextIndexes, reverse=True)[majority - 1]
+        return sorted(matchIndexes, reverse=True)[majority - 1]
 
     @property
     def local_server(self):
@@ -53,6 +54,17 @@ class Cluster:
 
     def shutdown(self):
         self._local_server.shutdown()
+
+    @property
+    def leader(self):
+        if self.leaderId == self.local_id:
+            return self._local_server
+
+        for server in self._remote_servers:
+            if server.id == self.leaderId:
+                return server
+
+        # Otherwise the leader is not known?
 
     @property
     @lru_cache

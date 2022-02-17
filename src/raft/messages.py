@@ -52,11 +52,36 @@ class RequestVote(Message):
     @dataclass
     class Response(Response):
         term: int
-        voteCast: bool
+        voteGranted: bool
 
     async def handle(self, server, sender) -> Response:
-        response = server.role.handle_request_vote()
-        self.respond(writer, term=server.currentTerm)
+        # Record the vote locally and only vote once per term
+        log.info(f"Received vote request from {server}")
+        should_vote = self.should_vote_for_candidate(server)
+        if should_vote:
+            server.voteFor(self.term, self.candidateId)
+
+        return self.Response(
+            term=server.currentTerm,
+            voteGranted=should_vote
+        )
+
+    def should_vote_for_candidate(self, server):
+        # Respond NO if sender term is less than local
+        if self.term < server.currentTerm:
+            return False
+        # Respond NO if sender log is shorter than local
+        elif self.lastLogIndex < server.log.lastIndex:
+            return False
+        elif server.log.lastEntry is not None \
+                and self.lastLogTerm < server.log.lastEntry.term:
+            return False
+        # Server can only vote once per term
+        elif server.config.hasVoted:
+            return False
+
+        # else respond YES
+        return True
 
 @dataclass
 class AppendEntries(Message):
@@ -71,16 +96,27 @@ class AppendEntries(Message):
     class Response(Response):
         term: int
         success: bool
+        matchIndex: int
 
     async def handle(self, server, sender) -> Response:
-        if self.term > server.term:
+        if self.term > server.currentTerm:
             raise NewTermError(self.term)
 
+        # It's important to call ::append_entries here, even if entries is
+        # empty, because the leader needs to know if new entries *could* be
+        # appended from the referenced prevLogIndex location.
         success = server.log.append_entries(self.entries, self.prevLogIndex,
             self.prevLogTerm)
 
         if success:
-            server.commitIndex = self.leaderCommit
+            await server.advanceCommitIndex(self.leaderCommit)
 
-        return self.Response(term=server.term, success=success)
+        # Update the cluster leader-id
+        server.cluster.leaderId = self.leaderId
+
+        # Apply "committed" entries
+        await server.log.apply_up_to(self.leaderCommit)
+
+        return self.Response(term=server.currentTerm, success=success,
+            matchIndex=len(server.log) - 1)
 
