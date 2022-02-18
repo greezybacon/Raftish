@@ -143,12 +143,12 @@ class WaitList(dict):
         message: Message
 
         @classmethod
-        def for_message(self, message: Message, lifetime=10):
+        def for_message(self, message: Message, lifetime):
             message = self(message=message, expires=time.monotonic() + lifetime)
             message.waiter = asyncio.get_event_loop().create_future()
             return message
 
-    async def wait_for(self, message: Message, timeout=10):
+    async def wait_for(self, message: Message, timeout=None):
         log.debug(f"Starting wait for message {message.id}")
         item = self[message.id] = self.Item.for_message(message, timeout or self.max_lifetime)
         return await asyncio.wait_for(item.waiter, timeout=timeout)
@@ -168,6 +168,7 @@ class WaitList(dict):
 
     def cleanup(self):
         now = time.monotonic()
-        to_remove = {id for id, x in self.items() if x.expires > now}
+        to_remove = {id for id, x in self.items() if x.expires < now}
         for id in to_remove:
+            # XXX: Should we send asyncio.TimeoutError into the waiter task?
             del self[id]
