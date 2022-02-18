@@ -95,9 +95,11 @@ class CandidateRole(Role):
                     votes += 1
                 if votes >= votes_needed:
                     break
-        finally:
+        except asyncio.TimeoutError:
             # Continue with the votes we collected (probably not enough
             # though..). But cancel the remaining vote requests first
+            pass
+        finally:
             for x in requests:
                 if not x.done():
                     x.cancel()
