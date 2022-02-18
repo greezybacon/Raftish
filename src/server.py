@@ -136,12 +136,17 @@ async def raft_kvserver(host='localhost', port=12347, db_path="/tmp/kvstore.db",
     }
 
     await app.start_cluster(local_id, config=config)
+    server = None
     while True:
         await app.local_server.role_changed.wait()
+
         if app.local_server.is_leader():
             print("Local system is the leader. Starting the application")
             server = await app.start_server((host, port))
-            await server.serve_forever()
+            await server.start_serving()
+        elif server:
+            print("No longer the leader. Shutting down application")
+            server.close()
 
 ### Command-line interface to run the servers
 

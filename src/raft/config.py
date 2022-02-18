@@ -56,16 +56,16 @@ class ClusterConfig:
             if x['id'] != self.local_id
         ]
 
-    def get_storage_path(self):
+    def get_storage_path(self, cleanup_temp=True):
         if 'storage_path' in self.config:
             return self.config['storage_path']
 
         # Create and return a temporary storage location
         path = f'/tmp/raft_node_{self.local_id}'
-        if os.path.exists(path):
+        if cleanup_temp and os.path.exists(path):
             shutil.rmtree(path)
 
-        os.mkdir(path)
+        os.makedirs(path, exist_ok=not cleanup_temp)
 
         return path
 

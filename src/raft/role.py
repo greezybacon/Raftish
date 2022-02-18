@@ -82,10 +82,11 @@ class CandidateRole(Role):
     async def hold_election(self, wait_time, votes_needed):
         votes = 1 # Vote for self
         try:
-            for request in asyncio.as_completed([
-                self.request_vote(server)
+            requests = {
+                asyncio.ensure_future(self.request_vote(server))
                 for server in self.local_server.cluster.remote_servers
-            ], timeout=wait_time):
+            }
+            for request in asyncio.as_completed(requests, timeout=wait_time):
                 response = await request
                 if response.term > self.local_server.currentTerm:
                     raise NewTermError(response.term)
@@ -94,10 +95,12 @@ class CandidateRole(Role):
                     votes += 1
                 if votes >= votes_needed:
                     break
-        except asyncio.TimeoutError:
+        finally:
             # Continue with the votes we collected (probably not enough
-            # though..)
-            pass
+            # though..). But cancel the remaining vote requests first
+            for x in requests:
+                if not x.done():
+                    x.cancel()
 
         # Return the results of the vote
         return votes
@@ -179,7 +182,6 @@ class LeaderRole(Role):
         heartbeat_time = min_heartbeat_time = self.heartbeat_time
         max_heartbeat_time = heartbeat_time * 5
         entryCount = 5
-        lost_messages = 0
         while True:
             # Okay- so the local log extends from 1 to lastIndex, unless
             # it's empty, in which case it extends from 0, prevIndex := the

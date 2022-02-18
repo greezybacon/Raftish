@@ -52,6 +52,9 @@ class LocalServer:
         self.config = LocalState(path)
 
     async def start(self):
+        # Load the log from disk
+        await self.log.load()
+
         # Open a socket and handle messages
         self.comm_tasks = [
             asyncio.create_task(self.receive_messages()),

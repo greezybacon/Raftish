@@ -170,5 +170,7 @@ class WaitList(dict):
         now = time.monotonic()
         to_remove = {id for id, x in self.items() if x.expires < now}
         for id in to_remove:
-            # XXX: Should we send asyncio.TimeoutError into the waiter task?
+            # Notify the waiter that a response isn't coming
+            if not self[id].waiter.done():
+                self[id].waiter.set_exception(asyncio.TimeoutError())
             del self[id]

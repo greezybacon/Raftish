@@ -37,8 +37,8 @@ class Application:
 
         self.cluster = cluster
         self.local_server = cluster.local_server
-        await self.local_server.start()
         self.local_server.log.add_apply_callback(self.commit)
+        await self.local_server.start()
 
     @property
     def has_quorum(self):

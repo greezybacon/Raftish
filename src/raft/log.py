@@ -7,6 +7,8 @@ import pickle
 import logging
 log = logging.getLogger('raft.log')
 
+from .storage import LogStorageBackend
+
 class TransactionLog(list):
     """
     The main thing in Raft. The transation log is replicated to all servers in
@@ -25,28 +27,24 @@ class TransactionLog(list):
     represents the first items and so on.
     """
     def __init__(self, disk_path):
-        self.disk_path = os.path.join(disk_path or '.', 'transcation_log')
+        self.disk_path = os.path.join(disk_path or '.')
         self.lastApplied = 0
         self.apply_callbacks = set()
         self.apply_event = asyncio.Event()
         self.application_lock = asyncio.Lock()
-        self.load()
+        self.storage = LogStorageBackend(self.disk_path)
 
-    def load(self):
-        try:
-            with open(self.disk_path, 'rb') as logfile:
-                self.extend(pickle.load(logfile))
-        except FileNotFoundError:
-            pass
+    async def load(self):
+        for chunk in self.storage.load():
+            log.info(f"Loading {len(chunk)} items from disk")
+            self.extend(chunk)
+        
+        await self.apply_up_to(self.lastIndex)
 
-    def save(self):
-        try:
-            # XXX: Maybe background, but ensure _log is not modified in the mean
-            # time?
-            with open(self.disk_path, 'wb') as logfile:
-                pickle.dump(self, logfile)
-        except IOError:
-            raise
+    def save(self, starting=0):
+        # XXX: Maybe background, but ensure _log is not modified in the mean
+        # time?
+        self.storage.save(self, starting)
 
     def append(self, entry):
         if len(self):
@@ -95,7 +93,8 @@ class TransactionLog(list):
 
             self[previousIndex:previousIndex+len(entries)] = entries
 
-            # TODO: Commit to disk
+            # Commit to disk
+            self.save(previousIndex)
 
         return True
 
