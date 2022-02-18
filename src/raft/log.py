@@ -164,11 +164,14 @@ class TransactionLog(list):
             entry: LogEntry = self.get(index)
             # XXX: If the apply fails for someone, then it will be resent for
             # everyone, which is probably outside the scope/intention of Raft.
-            if not all(await asyncio.gather(*(
-                    cb(entry)
-                    for cb in self.apply_callbacks
-                ))):
-                return False
+            try:
+                if not all(await asyncio.gather(*(
+                        cb(entry.value)
+                        for cb in self.apply_callbacks
+                    ))):
+                    return False
+            except:
+                log.exception("Error applying log transactions")
 
             self.lastApplied = index
 

@@ -12,8 +12,8 @@ class ClusterConfig:
     """
     default_config = {
         #"storage_path": "/tmp/raft_cluster/",
-        "election_timeout": 3,
-        "broadcast_timeout": 0.5,
+        "election_timeout": 0.3,
+        "broadcast_timeout": 0.05,
         "nodes": [
             {
                 "id": "server1",                # Used in cluster comm

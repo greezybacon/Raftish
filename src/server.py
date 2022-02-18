@@ -2,6 +2,12 @@ import asyncio
 from inspect import ClosureVars
 import time
 
+import logging
+logging.basicConfig(level=logging.INFO,
+    format="%(relativeCreated)d: %(levelname)s:%(name)s:%(message)s"
+)
+log = logging.getLogger('servers')
+
 async def timeserver(host='localhost', port=12345):
     async def handle_client(reader, writer):
         print("Connection from:", writer.get_extra_info('peername'))
