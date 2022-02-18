@@ -21,10 +21,15 @@ async def step_impl(context, n):
         }
         for _ in range(int(n))
     ]
+    config = {
+        "election_timeout": 0.3,
+        "broadcast_timeout": 0.05,
+        "nodes": nodes,
+    }
 
     # The same configuration from the perspective of each of the nodes
     context.configs = [
-        ClusterConfig.from_json(x['id'], {"nodes": nodes})
+        ClusterConfig.from_json(x['id'], config)
         for x in nodes
     ]
 
