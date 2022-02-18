@@ -109,7 +109,8 @@ class LocalServer:
                 if next_role is None:
                     raise DeadlockError("Role task returned but did not specify next role")
         except NewTermError as e:
-            await self.handle_new_term_error(e, must_switch=True)
+            await asyncio.shield(
+                self.handle_new_term_error(e, must_switch=True))
         except asyncio.CancelledError:
             # Happens when switching roles
             pass
