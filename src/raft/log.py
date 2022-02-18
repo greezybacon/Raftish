@@ -147,7 +147,10 @@ class TransactionLog(list):
         # If index > lastApplied, then apply all items in the transaction log up
         # to entry.index
         while self.lastApplied < index:
-            if not await self.apply(self.lastApplied + 1):
+            # Be careful not to cancel applications. If the enclosing task is
+            # cancelled, then this will be the last item applied to the state
+            # machine.
+            if not await asyncio.shield(self.apply(self.lastApplied + 1)):
                 return False
 
         return True

@@ -80,6 +80,7 @@ class CandidateRole(Role):
             await asyncio.sleep(max(0, wait_time - elapsed))
 
     async def hold_election(self, wait_time, votes_needed):
+        log.info("Holding a new election")
         votes = 1 # Vote for self
         try:
             requests = {

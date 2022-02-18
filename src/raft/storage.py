@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 import os, os.path
 import pickle
+import shutil
 import struct
 import time
 from typing import Iterable
@@ -36,7 +37,11 @@ class LogStorageBackend:
         open_file.seek(footer_offset, os.SEEK_SET)
         return pickle.load(open_file)
 
-    def save(self, transactions: Iterable, starting=0):
+    def save(self, transactions: Iterable, starting=0, start_index=0):
+        # TODO: Consider making the operation atomic by copying the part of the
+        # file to be kept to a new file and adding the new stuff to the end and
+        # then moving it into place.
+
         # Load the footer from the existing file
         start = time.monotonic()
         file_name = os.path.join(self.path, self.filename)
@@ -46,8 +51,8 @@ class LogStorageBackend:
         except FileNotFoundError:
             # XXX: The transaction log needs the concept of an offset/firstIndex
             # to support truncating for snapshots.
-            footer = self.Footer(startIndex=0, chunkSize=self.chunk_size,
-                offsets=[0])
+            footer = self.Footer(startIndex=start_index,
+                chunkSize=self.chunk_size, offsets=[0])
 
         # What chunk do we want to start writing
         chunk_size = footer.chunkSize

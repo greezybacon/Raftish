@@ -251,6 +251,7 @@ class LocalState:
     def load(self):
         try:
             with open(self.disk_path, 'rb') as config_file:
+                log.info("Recovering saved state from disk")
                 self._config = pickle.load(config_file)
         except (FileNotFoundError, EOFError):
             self._config = self.PersistentState()
