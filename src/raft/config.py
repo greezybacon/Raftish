@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os, os.path
 import shutil
@@ -27,6 +28,7 @@ class ClusterConfig:
     def __init__(self, local_id, json):
         self.local_id = local_id
         self.config = dict(self.default_config, **json)
+        self.config_changed = asyncio.Event()
 
     @classmethod
     def from_json(self, local_id, json):
@@ -58,6 +60,7 @@ class ClusterConfig:
         if 'storage_path' in self.config:
             return self.config['storage_path']
 
+        # Create and return a temporary storage location
         path = f'/tmp/raft_node_{self.local_id}'
         if os.path.exists(path):
             shutil.rmtree(path)

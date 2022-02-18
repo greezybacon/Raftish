@@ -37,44 +37,108 @@ async def echoserver_upper(host='localhost', port=12346):
 
 from store import KeyValueStore
 import pickle
+async def kvserver_handler(store, reader, writer):
+    async def do_get(key):
+        if key not in store:
+            return None
+        return store.get(key)
+
+    async def do_set(key, value):
+        await store.set(key, value)
+        return True
+
+    async def do_del(key):
+        await store.delete(key)
+        return True
+
+    print("Connection from:", writer.get_extra_info('peername'))
+    try:
+        while True:
+            message = await receive_message(reader)
+            cmd_name, *args = message
+            try:
+                cmd = locals()['do_' + cmd_name]
+                send_message(writer, await cmd(*args))
+            except AttributeError:
+                send_message(writer, False)    
+            
+    except asyncio.IncompleteReadError:
+        # Client likely disconnected
+        pass
+
 async def kvserver(host='localhost', port=12347, db_path="/tmp/kvstore.db"):
     store = KeyValueStore(db_path)
-
     async def handler(reader, writer):
-        async def do_get(key):
-            if key not in store:
-                return None
-            return store.get(key)
-
-        async def do_set(key, value):
-            await store.set(key, value)
-            return True
-
-        async def do_del(key):
-            await store.delete(key)
-            return True
-
-        print("Connection from:", writer.get_extra_info('peername'))
-        try:
-            while True:
-                message = await receive_message(reader)
-                cmd_name, *args = message
-                try:
-                    cmd = locals()['do_' + cmd_name]
-                    send_message(writer, await cmd(*args))
-                except AttributeError:
-                    send_message(writer, False)    
-                
-        except asyncio.IncompleteReadError:
-            # Client likely disconnected
-            pass
+        return await kvserver_handler(store, reader ,writer)
 
     server = await asyncio.start_server(handler, host, port)
     print(f"Listening on {host}:{port}")
     await server.serve_forever()
 
 
+from raft.app import Application
+from raft.log import LogEntry
+class KVStoreApp(Application):
+    class MockStore:
+        def __init__(self, app: Application):
+            self.app = app
 
+        async def set(self, name, value):
+            await self.app.submit(('set', name, value))
+        
+        def get(self, name):
+            # TODO: Ensure local machine is leader
+            assert self.app.is_local_leader()
+            return self.app.store.get(name)
+
+        def __contains__(self, name):
+            assert self.app.is_local_leader()
+            return name in self.app.store
+
+        async def delete(self, name):
+            await self.app.submit(('delete', name))
+
+    def __init__(self, db_path=None):
+        self.store = KeyValueStore(db_path)
+
+    async def commit(self, message):
+        log.info(f"GET COMMIT for {message}")
+        cmd, *args = message
+        if cmd == 'set':
+            key, value = args
+            await self.store.set(key, value)
+        elif cmd == 'delete':
+            await self.store.delete(args[0])
+
+        return True
+
+    async def handle_connection(self, reader, writer):
+        return await kvserver_handler(self.MockStore(self), reader, writer)
+
+from itertools import count
+async def raft_kvserver(host='localhost', port=12347, db_path="/tmp/kvstore.db",
+    local_id=1, raft_port=20000, cluster_size=3):
+    app = KVStoreApp(None)
+    id = count(1)
+    config = {
+        "nodes": [
+            {
+                "id": (lid := next(id)),
+                "port": raft_port + lid,
+                "listen": "::1",
+                "hostname": "::1"
+            }
+            for _ in range(int(cluster_size))
+        ]
+    }
+
+    await app.start_cluster(local_id, config=config)
+    while True:
+        await app.local_server.role_changed.wait()
+        if app.local_server.is_leader():
+            print("Local system is the leader. Starting the application")
+            server = await app.start_server((host, port))
+            await server.serve_forever()
 
 ### Command-line interface to run the servers
 
@@ -83,12 +147,19 @@ servers = {
     'echo': echoserver,
     'echoup': echoserver_upper,
     'kv': kvserver,
+    'raft_kv': raft_kvserver,
 }
 
 import argparse
 parser = argparse.ArgumentParser("RAFT :: Warmup Exercise")
 parser.add_argument("server", choices=servers.keys())
 
+parser.add_argument("--port", help="Application listening port", type=int)
+parser.add_argument("--local-id", help="LocalId for Raft server", type=int)
+parser.add_argument("--raft-port", help="Base listen port for Raft. The local-id is added to the port", type=int)
+parser.add_argument("--cluster-size", help="Size of the Raft cluster", type=int)
+
 if __name__ == '__main__':
     args = parser.parse_args()
-    asyncio.run(servers[args.server]())
+    params = {k: v for k, v in args._get_kwargs() if v is not None and k != 'server'}
+    asyncio.run(servers[args.server](**params))

@@ -49,7 +49,6 @@ class FollowerRole(Role):
                         timeout=self.timeout_time)
             except asyncio.TimeoutError:
                 # Suggest the server should transistion to the CandidateRole
-                log.info(f"No AppendEntries messages received after {self.timeout_time}s")
                 return CandidateRole
 
     async def handle_message(self, message: Message, sender):
@@ -63,40 +62,38 @@ class CandidateRole(Role):
     def __init__(self, server):
         super().__init__(server)
         # Election timeout is between 150 and 300ms
-        self.half_timeout = server.cluster.config.election_timeout / 2
+        self.election_timeout = server.cluster.config.election_timeout
 
     async def initiate(self):
-        try:
-            while True:
-                self.local_server.incrementTerm()
-                start = time.monotonic()
-                votes = await self.hold_election(self.half_timeout)
+        votes_needed = self.local_server.cluster.quorum_count
+        wait_time = self.election_timeout
+        while True:
+            self.local_server.incrementTerm()
+            start = time.monotonic()
+            votes = await self.hold_election(wait_time, votes_needed)
 
-                # Determine if this server won, if so then promote self to leader
-                votes_needed = self.local_server.cluster.quorum_count
-                if votes >= votes_needed:
-                    return LeaderRole
+            if votes >= votes_needed:
+                return LeaderRole
 
-                # Wait the remainder of the election timeout
-                delta = time.monotonic() - start
-                await asyncio.sleep(max(0, self.half_timeout * 2 - delta))
-        except NewTermError:
-            # Demote self to a follower
-            return FollowerRole
+            # Wait the remainder of the election timeout
+            elapsed = time.monotonic() - start
+            await asyncio.sleep(max(0, wait_time - elapsed))
 
-    async def hold_election(self, half_timeout):
+    async def hold_election(self, wait_time, votes_needed):
         votes = 1 # Vote for self
         try:
-            timeout = random.random() * half_timeout + half_timeout
             for request in asyncio.as_completed([
-                    self.request_vote(server)
-                    for server in self.local_server.cluster.remote_servers
-                    ], timeout=timeout):
+                self.request_vote(server)
+                for server in self.local_server.cluster.remote_servers
+            ], timeout=wait_time):
                 response = await request
                 if response.term > self.local_server.currentTerm:
-                    raise NewTermError
+                    raise NewTermError(response.term)
+                assert response.term == self.local_server.currentTerm
                 if response.voteGranted:
                     votes += 1
+                if votes >= votes_needed:
+                    break
         except asyncio.TimeoutError:
             # Continue with the responses we have
             pass
@@ -120,12 +117,13 @@ class CandidateRole(Role):
         ))
 
 class LeaderRole(Role):
-    def __init__(self, server):
+    def __init__(self, server, max_entry_count=20):
         super().__init__(server)
         # AppendEntries timeout is between 50ms, but can be configured in the
         # cluster configuration
-        self.timeout_time = server.cluster.config.broadcast_timeout
+        self.heartbeat_time = server.cluster.config.broadcast_timeout
         self.sync_event = asyncio.Event()
+        self.max_entry_count = max_entry_count
 
     async def initiate(self):
         # await timeout, and then send noop APPEND_ENTRIES message
@@ -140,44 +138,45 @@ class LeaderRole(Role):
         # LogEntries.
         try:
             while True:
-                try:
-                    # Also wait for exceptions from any of the sync tasks
-                    for task in asyncio.as_completed((
-                        local.log.apply_event.wait(),
-                        *self.server_tasks
-                    )):
-                        # Look for first completed or exception
-                        await task
-                        break
+                # Also wait for exceptions from any of the sync tasks
+                for task in asyncio.as_completed((
+                    self.sync_event.wait(),
+                    *self.server_tasks
+                )):
+                    # Look for first completed or exception
+                    await task
+                    break
 
-                    # Advance the commitIndex; however, only items in the
-                    # current leader's term can be used to advance the commit
-                    # index. Once advanced. Then all previous entries are also
-                    # committed.
+                self.sync_event.clear()
+
+                # Advance the commitIndex; however, only items in the
+                # current leader's term can be used to advance the commit
+                # index. Once advanced. Then all previous entries are also
+                # committed.
+                if len(local.log):
                     if local.currentTerm == local.log.lastEntry.term:
-                        local.commitIndex = local.cluster.lastCommitIndex
-                        await local.log.apply_up_to(local.commitIndex)
-                except NewTermError:
-                    log.info("Another server has a newer term than me")
-                    return FollowerRole
-        except asyncio.CancelledError:
-            # Propagate to the caller (server.do_role)
-            raise
+                        await local.advanceCommitIndex(local.cluster.lastCommitIndex())
         except:
-            log.exception("got one")
+            log.exception("Error in server sync task")
             raise
         finally:
             for task in self.server_tasks:
                 task.cancel()
 
     async def sync_server(self, server):
+        """
+        Remote server (follower) synchronization protocol.
+        """
         # Assume the remote server is at the same place in its logs are the
         # local server, and that we have no idea as to the state of the remote
         # server's log. This will result in the first message having empty
         # entries array which is what Raft requires.
         local = self.local_server
         nextIndex = local.log.lastIndex + 1
+        heartbeat_time = min_heartbeat_time = self.heartbeat_time
+        max_heartbeat_time = heartbeat_time * 5
         entryCount = 5
+        lost_messages = 0
         while True:
             # Okay- so the local log extends from 1 to lastIndex, unless
             # it's empty, in which case it extends from 0, prevIndex := the
@@ -211,14 +210,25 @@ class LeaderRole(Role):
                         entries=entries,
                         leaderCommit=local.commitIndex
                     ),
-                    timeout=self.timeout_time
+                    timeout=heartbeat_time
                 )
             except asyncio.TimeoutError:
                 # Maybe the message was too long?
                 entryCount = max(entryCount - 1, 1)
+                # Back off from the message send time
+                heartbeat_time = min(heartbeat_time * 1.05, max_heartbeat_time)
+                server.state.lostMessages += 1
                 continue
 
+            log.info(f"Got a response: {response}")
             assert type(response) is AppendEntries.Response
+
+            # Handle returning from lost messages
+            if lost_messages > 10:
+                # This is the first message after missing several
+                heartbeat_time = min_heartbeat_time
+
+            server.state.lostMessages = 0
 
             if response.term > local.currentTerm:
                 # Notify the main role task that the
@@ -227,7 +237,7 @@ class LeaderRole(Role):
 
             if response.success == True:
                 nextIndex += len(entries)
-                entryCount = max(entryCount + 1, 10)
+                entryCount = max(entryCount + 1, self.max_entry_count)
             else:
                 nextIndex -= 1
                 entryCount = max(entryCount - 1, 1)
@@ -238,6 +248,7 @@ class LeaderRole(Role):
 
             server.state.matchIndex = response.matchIndex
             server.state.nextIndex = nextIndex
+            self.sync_event.set()
 
             # Wait for either the idle timeout or a new append entry request to
             # be broadcast.
@@ -245,7 +256,7 @@ class LeaderRole(Role):
                 elapsed = time.monotonic() - start
                 await asyncio.wait_for(
                     local.append_event.wait(),
-                    timeout=max(0, self.timeout_time - elapsed)
+                    timeout=max(0, heartbeat_time - elapsed)
                 )
             except asyncio.TimeoutError:
                 pass

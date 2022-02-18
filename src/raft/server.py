@@ -1,13 +1,14 @@
 import asyncio
+import time
 from typing import Type
 import asyncio_dgram
 from dataclasses import dataclass
 import os, os.path
 import pickle
 
-from .exception import NewTermError, DeadlockError
+from .exception import NewTermError, DeadlockError, NotALeader
 from .log import TransactionLog
-from .messages import Message, Response
+from .messages import Message, Response, WaitList
 from .util import wait_for
 
 import logging
@@ -24,6 +25,7 @@ class LocalServer:
         self.out_queue = asyncio.Queue()
         self.in_queue = asyncio.Queue()
         self.listen_address = listen_address
+        self.wait_list = WaitList()
 
         # Persistent state
         self.config = None
@@ -36,6 +38,7 @@ class LocalServer:
         # Coordination
         self.role = None
         self.append_event = asyncio.Event()
+        self.role_changed = asyncio.Event()
 
     @property
     def id(self):
@@ -93,14 +96,15 @@ class LocalServer:
     async def do_role(self, next_role: Type["Role"]):
         try:
             while True:
-                log.info(f"Switching to {next_role} role")
+                log.info(f"{self.id}: Switching to {next_role} role")
                 self.role = next_role(self)
+                self.role_changed.set()
+                self.role_changed.clear()
                 next_role = await self.role.initiate()
                 if next_role is None:
-                    log.warning("Potential deadlock. Role task returned byt did not specify the next role")
-                    break
-                    #raise DeadlockError("Role task returned but did not specify next role")
+                    raise DeadlockError("Role task returned but did not specify next role")
         except asyncio.CancelledError:
+            # Happens when switching roles
             pass
 
         self.role = None
@@ -149,7 +153,8 @@ class LocalServer:
         await self.switch_role(LeaderRole)
     
     def append_entry(self, entry):
-        assert self.is_leader()
+        if not self.is_leader():
+            raise NotALeader
 
         # It's assumed that the local server is the leader
         lastId = self.log.append(entry)
@@ -176,20 +181,14 @@ class LocalServer:
             await message.send(self.socket, dest_addr)
         
     async def receive_messages(self):
-        remote_servers = {
-            x.address: x
-            for x in self.cluster.remote_servers
-        }
-
         await self.ensure_dgram_endpoint()
         try:
             while True:
                 message, sender = await self.socket.recv()
                 message = Message.from_bytes(message)
-                if isinstance(message, Response) and sender[:2] in remote_servers:
-                    # Looks like a response. Put it in the in-bound message queue
-                    # for the remote server instance.
-                    await remote_servers[sender[:2]].in_queue.put(message)
+                if isinstance(message, Response):
+                    # Looks like a response. See if a message is waiting on it.
+                    self.wait_list.set_response(message)
                 else:
                     # Message is a request for the local server node
                     await self.in_queue.put((message, sender))
@@ -213,12 +212,12 @@ class LocalServer:
                     self.config.currentTerm = e.term
                     if not self.is_follower():
                         await self.switch_role(FollowerRole)
-                    else:
-                        # Try the message again with the new term
-                        response = await self.role.handle_message(message, sender)
-                finally:
-                    if response:
-                        await response.send(self.socket, sender)
+
+                    # Try the message again with the new term
+                    response = await self.role.handle_message(message, sender)
+
+                if response:
+                    await message.respond_with(response, self.socket, sender)
         except asyncio.CancelledError:
             # Server is shutting down
             pass
@@ -246,7 +245,7 @@ class LocalState:
         except (FileNotFoundError, EOFError):
             self._config = self.PersistentState()
 
-    # Disk-backed state
+    # Disk-backed state ------
 
     @property
     def currentTerm(self):
@@ -264,6 +263,7 @@ class LocalState:
 
     def voteFor(self, term, serverId):
         assert term >= self._config.term
+        assert not self.hasVoted
         self._config.term = term
         self._config.votedFor = serverId
         self._sync()
@@ -287,25 +287,25 @@ class RemoteServer:
     class State:
         nextIndex: int  = 0
         matchIndex: int = 0 
+        lostMessages: int = -1
 
     def __init__(self, id, hostname, port):
         self.id = id
         self.address = (hostname, port)
         self.state = self.State()
 
-    async def start(self, server):
+    async def start(self, server: LocalServer):
         self.out_queue = server.out_queue
-        self.in_queue = asyncio.Queue()
+        self.wait_list = server.wait_list
 
     async def transceive(self, message, timeout=None):
+        message.ensure_id()
         await self.out_queue.put((message, self.address))
-        response = await wait_for(self.in_queue.get(), timeout=timeout)
+        return await self.wait_list.wait_for(message, timeout=timeout)
 
-        assert(type(response) in (None, message.Response))
-        return response
-
-    async def receive(self, timeout=None):
-        return await self.in_queue.get(timeout=timeout)
+    @property
+    def is_online(self):
+        return self.state.lostMessages == 0
 
     def __repr__(self):
         return f"<Server: ({self.id}) @ {self.address}>"

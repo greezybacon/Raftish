@@ -144,6 +144,9 @@ class TransactionLog(list):
     async def apply_up_to(self, index):
         # Can't apply past the end of the local log
         assert index <= self.lastIndex
+
+        # If index > lastApplied, then apply all items in the transaction log up
+        # to entry.index
         while self.lastApplied < index:
             if not await self.apply(self.lastApplied + 1):
                 return False
@@ -155,11 +158,8 @@ class TransactionLog(list):
         # from the concensus backend. The local server
         assert self.lastApplied < index
 
-        # TODO: If entry.index > lastApplied, then apply all items in the
-        # transaction log up to entry.index
-
         async with self.application_lock:
-            entry = self[index-1]
+            entry: LogEntry = self.get(index)
             # XXX: If the apply fails for someone, then it will be resent for
             # everyone, which is probably outside the scope/intention of Raft.
             if not all(await asyncio.gather(*(
@@ -172,6 +172,7 @@ class TransactionLog(list):
 
             # XXX: Timeout?
 
+        # Wake up anyone awaiting a transaction application
         self.apply_event.set()
         self.apply_event.clear()
 

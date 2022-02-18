@@ -3,6 +3,9 @@ from functools import lru_cache
 from .config import ClusterConfig
 from .server import RemoteServer, LocalServer
 
+import logging
+log = logging.getLogger('raft.cluster')
+
 class Cluster:
     """
     Represents the cluster as a whole, which has its own configuration.
@@ -37,6 +40,7 @@ class Cluster:
 
     def lastCommitIndex(self):
         matchIndexes = [x.state.matchIndex for x in self.remote_servers]
+        matchIndexes.append(self._local_server.log.lastIndex)
         # Find the nextIndex number that the majority of the systems are greater
         # than. To find that, sort the list and take the ::quorum_count item
         majority = self.quorum_count
@@ -44,6 +48,11 @@ class Cluster:
             return 0
 
         return sorted(matchIndexes, reverse=True)[majority - 1]
+
+    @property
+    def has_consensus(self):
+        online = sum(1 if x.is_online else 0 for x in self.remote_servers)
+        return online + 1 >= self.quorum_count
 
     @property
     def local_server(self):
@@ -69,5 +78,4 @@ class Cluster:
     @property
     @lru_cache
     def quorum_count(self):
-        # XXX: This can be memoized
         return ((len(self._remote_servers) + 1) // 2) + 1
