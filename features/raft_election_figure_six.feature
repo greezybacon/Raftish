@@ -13,8 +13,8 @@ Feature: Leaders are elected as expected
 
         Scenario Outline: Only three of the five servers could win an election
              When node <candidate> becomes a candidate for term 4
-              And after a pause of 0.5 seconds
-             Then node <candidate> is_leader == <can_win>
+             Then the cluster will have a leader
+              And node <candidate> is_leader == <can_win>
 
             Examples:
                 | candidate   | can_win |

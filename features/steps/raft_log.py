@@ -1,4 +1,7 @@
+import asyncio
 from behave import given, when, then
+from behave.api.async_step import async_run_until_complete as async_step
+import time
 
 from raft.log import LogEntry, TransactionLog
 
@@ -65,3 +68,16 @@ def step_impl(context, content):
         term=local_server.currentTerm,
         value=content
     ))
+
+@when("log entry {n} is committed")
+@async_step
+async def step_impl(context, n):
+    n = int(n)
+    deadline = time.monotonic() + 1
+    while context.leader.commitIndex < n:
+        await asyncio.wait_for(
+            context.leader.log.apply_event.wait(),
+            timeout=deadline - time.monotonic()
+        )
+
+    assert context.leader.commitIndex >= n

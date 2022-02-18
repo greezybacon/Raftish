@@ -79,7 +79,7 @@ async def kvserver(host='localhost', port=12347, db_path="/tmp/kvstore.db"):
 from raft.app import Application
 from raft.log import LogEntry
 class KVStoreApp(Application):
-    class MockStore:
+    class StoreProxy:
         def __init__(self, app: Application):
             self.app = app
 
@@ -87,8 +87,11 @@ class KVStoreApp(Application):
             await self.app.submit(('set', name, value))
         
         def get(self, name):
-            # TODO: Ensure local machine is leader
-            assert self.app.is_local_leader()
+            # Ensure local machine is leader and that the cluster has a quorum
+            assert self.app.is_local_leader() and self.app.cluster.has_quorum
+            # TODO: If application is accessible from a read replica, ensure the
+            # cluster has consensus and the local server (follower) is up to
+            # date
             return self.app.store.get(name)
 
         def __contains__(self, name):
@@ -113,7 +116,7 @@ class KVStoreApp(Application):
         return True
 
     async def handle_connection(self, reader, writer):
-        return await kvserver_handler(self.MockStore(self), reader, writer)
+        return await kvserver_handler(self.StoreProxy(self), reader, writer)
 
 from itertools import count
 async def raft_kvserver(host='localhost', port=12347, db_path="/tmp/kvstore.db",

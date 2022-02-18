@@ -16,3 +16,18 @@ async def step_impl(context, n, term):
 def step_impl(context, n, bool):
     n = int(n)
     assert context.servers[n].is_leader() == (bool == 'True')
+
+@then('the cluster will have a leader')
+@async_step
+async def step_impl(context):
+    for _ in range(10):
+        await asyncio.wait([
+            server.role_changed.wait()
+            for server in context.servers
+        ], return_when=asyncio.FIRST_COMPLETED, timeout=0.1)
+
+        for server in context.servers:
+            if server.is_leader():
+                return
+
+    assert False, "Cluster did not elect a leader"

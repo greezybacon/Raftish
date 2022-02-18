@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import os, os.path
 import pickle
 
-from .exception import NewTermError, DeadlockError, NotALeader
+from .exception import LocalAppendFailed, NewTermError, DeadlockError, NotALeader
 from .log import TransactionLog
 from .messages import Message, Response, WaitList
 from .util import wait_for
@@ -93,6 +93,11 @@ class LocalServer:
         while type(self.role) is not new_role:
             await asyncio.sleep(0)
 
+    async def handle_new_term_error(self, error: NewTermError, must_switch=False):
+        self.config.currentTerm = error.term
+        if must_switch or not self.is_follower():
+            await self.switch_role(FollowerRole)
+
     async def do_role(self, next_role: Type["Role"]):
         try:
             while True:
@@ -103,6 +108,8 @@ class LocalServer:
                 next_role = await self.role.initiate()
                 if next_role is None:
                     raise DeadlockError("Role task returned but did not specify next role")
+        except NewTermError as e:
+            await self.handle_new_term_error(e, must_switch=True)
         except asyncio.CancelledError:
             # Happens when switching roles
             pass
@@ -158,11 +165,12 @@ class LocalServer:
 
         # It's assumed that the local server is the leader
         lastId = self.log.append(entry)
-        if lastId is not False:
-            # Tickle the append_event for anyone listening
-            log.info("Signalling the append_event")
-            self.append_event.set()
-            self.append_event.clear()
+        if lastId is False:
+            raise LocalAppendFailed
+
+        # Tickle the append_event for anyone listening
+        self.append_event.set()
+        self.append_event.clear()
 
         return lastId
 
@@ -209,9 +217,7 @@ class LocalServer:
                 except NewTermError as e:
                     # The incoming message indicates a new sherrif in town. Demote
                     # to follower
-                    self.config.currentTerm = e.term
-                    if not self.is_follower():
-                        await self.switch_role(FollowerRole)
+                    await self.handle_new_term_error(e)
 
                     # Try the message again with the new term
                     response = await self.role.handle_message(message, sender)

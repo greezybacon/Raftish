@@ -95,7 +95,8 @@ class CandidateRole(Role):
                 if votes >= votes_needed:
                     break
         except asyncio.TimeoutError:
-            # Continue with the responses we have
+            # Continue with the votes we collected (probably not enough
+            # though..)
             pass
 
         # Return the results of the vote
@@ -156,6 +157,8 @@ class LeaderRole(Role):
                 if len(local.log):
                     if local.currentTerm == local.log.lastEntry.term:
                         await local.advanceCommitIndex(local.cluster.lastCommitIndex())
+        except asyncio.CancelledError:
+            raise
         except:
             log.exception("Error in server sync task")
             raise
@@ -220,11 +223,10 @@ class LeaderRole(Role):
                 server.state.lostMessages += 1
                 continue
 
-            log.info(f"Got a response: {response}")
             assert type(response) is AppendEntries.Response
 
             # Handle returning from lost messages
-            if lost_messages > 10:
+            if server.state.lostMessages > 10:
                 # This is the first message after missing several
                 heartbeat_time = min_heartbeat_time
 

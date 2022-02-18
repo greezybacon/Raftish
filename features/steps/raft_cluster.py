@@ -96,11 +96,3 @@ def step_impl(context, terms):
         for term, entry in zip(terms, server.log):
             assert term == entry.term
         assert len(server.log) == len(terms) 
-
-@then('the cluster will have a leader')
-def step_impl(context):
-    for server in context.servers:
-        if server.is_leader():
-            break
-    else:
-        assert False, "No node in the cluster is a leader"

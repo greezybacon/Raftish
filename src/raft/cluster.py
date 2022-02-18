@@ -1,3 +1,4 @@
+import asyncio
 from functools import lru_cache
 
 from .config import ClusterConfig
@@ -50,7 +51,7 @@ class Cluster:
         return sorted(matchIndexes, reverse=True)[majority - 1]
 
     @property
-    def has_consensus(self):
+    def has_quorum(self):
         online = sum(1 if x.is_online else 0 for x in self.remote_servers)
         return online + 1 >= self.quorum_count
 
