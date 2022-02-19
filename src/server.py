@@ -110,7 +110,6 @@ class KVStoreApp(Application):
         self.store = KeyValueStore(db_path)
 
     async def commit(self, message):
-        log.info(f"GET COMMIT for {message}")
         cmd, *args = message
         if cmd == 'set':
             key, value = args
@@ -147,12 +146,19 @@ async def raft_kvserver(host='localhost', port=12347, db_path="/tmp/kvstore.db",
 
         if app.local_server.is_leader():
             print("Local system is the leader. Starting the application")
-            server = await app.start_server((host, port))
-            await server.start_serving()
+            for _ in range(10):
+                try:
+                    server = await app.start_server((host, port))
+                    await server.start_serving()
+                    print("Application is running")
+                    break
+                except OSError:
+                    # Sometimes this happens when switching leaders
+                    pass
         elif server:
             print("No longer the leader. Shutting down application")
             server.close()
-            await server.close_wait()
+            await server.wait_closed()
             server = None
 
 ### Command-line interface to run the servers

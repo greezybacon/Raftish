@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 import os, os.path
 import pickle
-import shutil
 import struct
 import time
 from typing import Iterable
@@ -12,6 +11,26 @@ log = logging.getLogger('raft.storage')
 class LogStorageBackend:
     """
     Backend which can load or persist a TransactionLog to and from disk.
+
+    Format:
+    The on-disk format for the transaction log is a number of pickle objects
+    followed by a single 4-byte integer:
+
+        pickle<list[LogEntry]>
+        pickle<list[LogEntry]>
+        ...
+        pickle<LogStorageBackend.Footer>
+        sizeof<Footer>
+
+    Seeking the file is simplest by reading the 4-byte footer-size at the end of
+    the file. Then seek to the end of the file minus that size, minus the
+    4-bytes. Then read the Footer.
+
+    The Footer object includes a list of location offsets of each of the chunks.
+    To read all the chunks, start reading with pickle.load() from the beginning
+    of the file. To read a specific chunk, use the offset list in the footer to
+    find the location of the desired chunk. Then seek to that location and use
+    pickle.load to read the chunk.
     """
     @dataclass
     class Footer:
@@ -35,7 +54,7 @@ class LogStorageBackend:
         open_file.seek(-self._footer_size, os.SEEK_END)
         footer_offset, = struct.unpack("!I", open_file.read(self._footer_size))
         open_file.seek(footer_offset, os.SEEK_SET)
-        return pickle.load(open_file)
+        return pickle.load(open_file), footer_offset
 
     def save(self, transactions: Iterable, starting=0, start_index=0):
         # TODO: Consider making the operation atomic by copying the part of the
@@ -47,19 +66,24 @@ class LogStorageBackend:
         file_name = os.path.join(self.path, self.filename)
         try:
             with open(file_name, 'rb') as infile:
-                footer = self._read_footer(infile)
+                footer, footer_offset = self._read_footer(infile)
         except FileNotFoundError:
             # XXX: The transaction log needs the concept of an offset/firstIndex
             # to support truncating for snapshots.
             footer = self.Footer(startIndex=start_index,
                 chunkSize=self.chunk_size, offsets=[0])
+            footer_offset = 0
 
         # What chunk do we want to start writing
         chunk_size = footer.chunkSize
         start_chunk = starting // chunk_size
-        assert len(footer.offsets) > start_chunk
-        start_offset = footer.offsets[start_chunk]
         footer.chunksInFile = start_chunk
+        if start_chunk < len(footer.offsets):
+            start_offset = footer.offsets[start_chunk]
+        else:
+            # New chunk
+            start_offset = footer_offset
+            footer.offsets.append(start_offset)
 
         # Truncate the file at the offset plus header size
         if os.path.exists(file_name):
@@ -85,7 +109,7 @@ class LogStorageBackend:
             outfile.write(struct.pack("!I", footer_offset))
 
         elapsed = time.monotonic() - start
-        log.info(f"Updating log file took {elapsed:.3f}s")
+        log.debug(f"Updating log file took {elapsed:.3f}s")
 
     def load(self, starting=0):
         """
@@ -96,6 +120,7 @@ class LogStorageBackend:
         file_path = os.path.join(self.path, self.filename)
         try:
             with open(file_path, "rb") as infile:
+                log.info(f"Loading transaction log from file {file_path}")
                 # Skip the header
                 while True:
                     chunk = pickle.load(infile)

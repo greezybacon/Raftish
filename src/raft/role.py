@@ -131,6 +131,14 @@ class CandidateRole(Role):
 
 class LeaderRole(Role):
     def __init__(self, server, max_entry_count=20):
+        """
+        Parameters:
+        server: LocalServer
+            The local server (which happens to be the leader)
+        max_entry_count: int
+            Maximum number of entries to send to a remote server in the
+            AppendEntries message
+        """
         super().__init__(server)
         # AppendEntries timeout is between 50ms, but can be configured in the
         # cluster configuration
@@ -139,14 +147,14 @@ class LeaderRole(Role):
         self.max_entry_count = max_entry_count
 
     async def initiate(self):
-        # await timeout, and then send noop APPEND_ENTRIES message
+        # Start tasks to send heartbeats to all the cluster members
         local = self.local_server
         self.server_tasks = [
             asyncio.create_task(self.sync_server(server))
             for server in local.cluster.remote_servers
         ]
 
-        # Watch the transaction application and update the local server
+        # Watch the synchronization events and update the local server
         # commitIndex when the cluster reaches concensus on the appending of the
         # LogEntries.
         try:

@@ -39,8 +39,6 @@ class TransactionLog(list):
             log.info(f"Loading {len(chunk)} items from disk")
             self.extend(chunk)
         
-        await self.apply_up_to(self.lastIndex)
-
     def save(self, starting=0):
         # XXX: Maybe background, but ensure _log is not modified in the mean
         # time?
@@ -140,18 +138,26 @@ class TransactionLog(list):
     def add_apply_callback(self, callback):
         self.apply_callbacks.add(callback)
 
-    async def apply_up_to(self, index):
+    async def apply_up_to(self, index, max_entries=500):
         # Can't apply past the end of the local log
         assert index <= self.lastIndex
 
         # If index > lastApplied, then apply all items in the transaction log up
-        # to entry.index
+        # to index (with a maximum to provide reasonable message response timing)
+        index = min(index, self.lastApplied + max_entries)
         while self.lastApplied < index:
             # Be careful not to cancel applications. If the enclosing task is
             # cancelled, then this will be the last item applied to the state
             # machine.
             if not await asyncio.shield(self.apply(self.lastApplied + 1)):
                 return False
+
+            # Ensure other tasks aren't neglected from applying a long log, like
+            # e.g. when a new starting a cluster from disk transaction log and
+            # then the first append happens (and all the logs are suddenly in
+            # need of application.)
+            if self.lastApplied % 10 == 1:
+                await asyncio.sleep(0)
 
         return True
 
