@@ -83,7 +83,6 @@ async def kvserver(host='localhost', port=12347, db_path="/tmp/kvstore.db"):
 
 
 from raft.app import Application
-from raft.log import LogEntry
 class KVStoreApp(Application):
     class StoreProxy:
         def __init__(self, app: Application):
@@ -153,6 +152,8 @@ async def raft_kvserver(host='localhost', port=12347, db_path="/tmp/kvstore.db",
         elif server:
             print("No longer the leader. Shutting down application")
             server.close()
+            await server.close_wait()
+            server = None
 
 ### Command-line interface to run the servers
 

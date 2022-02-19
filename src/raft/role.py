@@ -5,6 +5,7 @@ import time
 from .exception import NewTermError
 from .messages import Message, AppendEntries, RequestVote
 from .server import RemoteServer
+from .util import complete_or_cancel
 
 import logging
 log = logging.getLogger('raft.role')
@@ -82,18 +83,23 @@ class CandidateRole(Role):
     async def hold_election(self, wait_time, votes_needed):
         log.info("Holding a new election")
         votes = 1 # Vote for self
+
+        constituants = [
+            asyncio.ensure_future(self.request_vote(server))
+            for server in self.local_server.cluster.remote_servers
+        ]
         try:
-            requests = {
-                asyncio.ensure_future(self.request_vote(server))
-                for server in self.local_server.cluster.remote_servers
-            }
-            for request in asyncio.as_completed(requests, timeout=wait_time):
+            for request in asyncio.as_completed(constituants, timeout=wait_time):
                 response = await request
+
                 if response.term > self.local_server.currentTerm:
                     raise NewTermError(response.term)
+
                 assert response.term == self.local_server.currentTerm
+
                 if response.voteGranted:
                     votes += 1
+
                 if votes >= votes_needed:
                     break
         except asyncio.TimeoutError:
@@ -101,7 +107,7 @@ class CandidateRole(Role):
             # though..). But cancel the remaining vote requests first
             pass
         finally:
-            for x in requests:
+            for x in constituants:
                 if not x.done():
                     x.cancel()
 
@@ -146,13 +152,16 @@ class LeaderRole(Role):
         try:
             while True:
                 # Also wait for exceptions from any of the sync tasks
-                for task in asyncio.as_completed((
+                with complete_or_cancel((
                     self.sync_event.wait(),
-                    *self.server_tasks
-                )):
-                    # Look for first completed or exception
-                    await task
-                    break
+                )) as tasks:
+                    for task in asyncio.as_completed((
+                        *tasks,
+                        *self.server_tasks
+                    )):
+                        # Look for first completed or exception
+                        await task
+                        break
 
                 self.sync_event.clear()
 
@@ -168,9 +177,6 @@ class LeaderRole(Role):
         except:
             log.exception("Error in server sync task")
             raise
-        finally:
-            for task in self.server_tasks:
-                task.cancel()
 
     async def sync_server(self, server):
         """
@@ -226,6 +232,8 @@ class LeaderRole(Role):
                 # Back off from the message send time
                 heartbeat_time = min(heartbeat_time * 1.05, max_heartbeat_time)
                 server.state.lostMessages += 1
+                if server.state.lostMessages == 10:
+                    log.warning(f"Trouble communicating with server {server.id}")
                 continue
 
             assert type(response) is AppendEntries.Response
@@ -233,6 +241,7 @@ class LeaderRole(Role):
             # Handle returning from lost messages
             if server.state.lostMessages > 10:
                 # This is the first message after missing several
+                log.info(f"Resuming sync of server {server.id}")
                 heartbeat_time = min_heartbeat_time
 
             server.state.lostMessages = 0

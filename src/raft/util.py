@@ -6,11 +6,15 @@
 # cancels the awaited task and raises TimeoutError if the timeout expired.
 
 import asyncio
+import contextlib
 import enum
 import sys
 import warnings
 from types import TracebackType
 from typing import Any, Optional, Type
+
+import logging
+log = logging.getLogger('raft.util')
 
 def _timeout(delay: Optional[float]) -> "Timeout":
     """timeout context manager.
@@ -217,3 +221,16 @@ async def wait_for(aw, timeout, *, loop=None):
         return await aw
 
 asyncio.wait_for = wait_for
+
+@contextlib.contextmanager
+def complete_or_cancel(aws):
+    aws = {
+        asyncio.ensure_future(x)
+        for x in aws
+    }
+
+    yield aws
+
+    for x in aws:
+        if not x.done():
+            x.cancel()
