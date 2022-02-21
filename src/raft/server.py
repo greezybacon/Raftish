@@ -99,6 +99,7 @@ class LocalServer:
     async def handle_new_term_error(self, error: NewTermError, must_switch=False):
         self.config.currentTerm = error.term
         if must_switch or not self.is_follower():
+            self.role = None
             await self.switch_role(FollowerRole)
 
     async def do_role(self, next_role: Type["Role"]):
@@ -124,15 +125,10 @@ class LocalServer:
     def commitIndex(self):
         return self._commitIndex
 
-    @commitIndex.setter
-    def commitIndex(self, value):
-        assert value >= self._commitIndex
-        self._commitIndex = value
-
     async def advanceCommitIndex(self, index):
         # Ensure the commit index doesn't advance past the end of the log
         index = min(self.log.lastIndex, index)
-        self.commitIndex = index
+        self._commitIndex = index
         await self.log.apply_up_to(index)
 
     @property

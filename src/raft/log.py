@@ -2,14 +2,13 @@ import asyncio
 from dataclasses import dataclass
 from itertools import count
 import os, os.path
-import pickle
+
+from .storage import LogStorageBackend
 
 import logging
 log = logging.getLogger('raft.log')
 
-from .storage import LogStorageBackend
-
-class TransactionLog(list):
+class LogBase(list):
     """
     The main thing in Raft. The transation log is replicated to all servers in
     the cluster and is guaranted to be exactly the same as the version on the
@@ -26,23 +25,17 @@ class TransactionLog(list):
     Entries in the log are 1-based. 0 represents the index of an empty log, 1
     represents the first items and so on.
     """
-    def __init__(self, disk_path):
-        self.disk_path = os.path.join(disk_path or '.')
+    def __init__(self):
+        """
+        Parameters:
+        disk_path: str
+            Folder where the files for the transaction log are stored.
+        """
         self.lastApplied = 0
+        self.start_index = 1
         self.apply_callbacks = set()
         self.apply_event = asyncio.Event()
         self.application_lock = asyncio.Lock()
-        self.storage = LogStorageBackend(self.disk_path)
-
-    async def load(self):
-        for chunk in self.storage.load():
-            log.info(f"Loading {len(chunk)} items from disk")
-            self.extend(chunk)
-        
-    def save(self, starting=0):
-        # XXX: Maybe background, but ensure _log is not modified in the mean
-        # time?
-        self.storage.save(self, starting)
 
     def append(self, entry):
         if len(self):
@@ -52,11 +45,11 @@ class TransactionLog(list):
 
         if self.append_entries([entry], self.lastIndex, term):
             return self.lastIndex
-        
+
         return False
 
     def append_entries(self, entries, previousIndex=None, previousTerm=None):
-        if previousIndex > len(self):
+        if previousIndex > self.lastIndex:
             # Gap
             return False
 
@@ -73,42 +66,55 @@ class TransactionLog(list):
             # Bogus index number
             return False
 
+        # Offset the index by the start of the this list
+        slice_start = previousIndex - (self.start_index - 1)
+
         if len(entries) > 0:
             # If there are existing log entries at the specified position, but
             # they are from a different term, then the existing entry and
             # everything that follows it needs to be deleted.
-            if previousIndex < len(self):
-                for index, entry in zip(count(previousIndex), entries):
+            if previousIndex < self.lastIndex:
+                for index, entry in zip(range(previousIndex, self.lastIndex+1), entries):
                     # NOTE This is checking for REPLACING an entry which would
                     # mean to check the entry AFTER the previousIndex
                     if self.get(index).term != entry.term:
                         # Truncate the log after the last index
                         log.warning(f"Truncating log entries after {previousIndex}")
-                        del self[previousIndex:]
+                        del self[slice_start:]
                         break
 
                 # else: Same index and term -- simple replacement?
 
-            self[previousIndex:previousIndex+len(entries)] = entries
+            self[slice_start:slice_start+len(entries)] = entries
 
             # Commit to disk
             self.save(previousIndex)
 
         return True
 
-    def commit(self, entry):
-        pass
+    def truncate_before(self, start_index):
+        """
+        Caveats:
+        start_index is based on the absolute log beginning (index 1) and not the
+        current size or offset of the log.
+        """
+        log.info(f"Truncating log before {start_index}")
+        remainder = self.lastIndex - start_index
+        if remainder > 0:
+            self[:remainder] = self[start_index - self.start_index:]
+            del self[remainder+1:]
+            self.start_index = start_index
 
     @property
     def lastIndex(self):
-        return len(self)
+        return len(self) + self.start_index - 1
 
     @property
     def previousTerm(self):
         try:
             return self.lastEntry.term
         except AttributeError:
-            return 0 
+            return 0
 
     @property
     def lastEntry(self):
@@ -117,23 +123,22 @@ class TransactionLog(list):
 
         return self[-1]
 
-    def since(self, index, max_entries=10):
-        # Start at the lesser of the requested ID and the last appended index
-        start = min(index, self.lastIndex)
-        # Stop at the lesser of MAX_ENTRIES from the end of the log
-        stop = min(start + max_entries, self.lastIndex)
-        # index is 1-based, so no need to add one
-        return self[start:stop]
-
     def get(self, index):
-        return self[index-1]
+        if index < self.start_index:
+            return self.storage.get(index)
+
+        try:
+            return self[index - self.start_index]
+        except IndexError:
+            log.exception(f"Failed to load index {index}")
+            raise
 
     def entryBefore(self, index):
-        start = min(index, self.lastIndex)
+        start = min(index, self.lastIndex) - self.start_index
         if start < 0:
             return None
 
-        return self.get(start - 1)
+        return self.get(start)
 
     def add_apply_callback(self, callback):
         self.apply_callbacks.add(callback)
@@ -149,7 +154,7 @@ class TransactionLog(list):
             # Be careful not to cancel applications. If the enclosing task is
             # cancelled, then this will be the last item applied to the state
             # machine.
-            if not await asyncio.shield(self.apply(self.lastApplied + 1)):
+            if not await self.apply(self.lastApplied + 1):
                 return False
 
             # Ensure other tasks aren't neglected from applying a long log, like
@@ -200,3 +205,52 @@ class LogEntry:
     """
     term : int
     value : object
+
+
+class TransactionLog(LogBase):
+    def __init__(self, disk_path):
+        """
+        Parameters:
+        disk_path: str
+            Folder where the files for the transaction log are stored.
+        """
+        super().__init__()
+        self.disk_path = os.path.join(disk_path or '.')
+        self.storage = LogStorageBackend(self.disk_path)
+
+    async def load(self):
+        for chunk in self.storage.load():
+            log.info(f"Loading {len(chunk)} items from disk")
+            self.extend(chunk)
+
+    def save(self, starting=0):
+        # When saving, ensure the log entries to be saved are offset by the
+        # starting index of this log
+        self.storage.save(self, starting, self.start_index - 1)
+
+    async def load(self):
+        for chunk in self.storage.load():
+            log.info(f"Loading {len(chunk)} items from disk")
+            self.extend(chunk)
+
+    def since(self, index, max_entries=10):
+        earliest = self.start_index - 1
+        if index < earliest:
+            # Not available in the live log. Load from disk
+            return self.since_from_archive(index, max_entries)
+
+        # Start at the lesser of the requested ID and the last appended index
+        # Stop at the lesser of MAX_ENTRIES from the end of the log
+        start = min(index, self.lastIndex)
+        stop = min(start + max_entries, self.lastIndex)
+        # index is 1-based, so no need to add one
+        return self[start-earliest:stop-earliest]
+
+    def since_from_archive(self, index, max_entries=10):
+        # Disk-backed log currently always starts from 1
+        log.info(f"Loading logs from disk, @{index}+{max_entries}")
+        entries = self.storage.load_partial(count=max_entries, starting=index)
+        return list(entries)
+
+    def purge(self):
+        return self.storage.purge()

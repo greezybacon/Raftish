@@ -1,8 +1,10 @@
 from dataclasses import dataclass, field
+from functools import lru_cache
 import os, os.path
 import pickle
 import struct
 import time
+from tracemalloc import start
 from typing import Iterable
 
 import logging
@@ -34,21 +36,23 @@ class LogStorageBackend:
     """
     @dataclass
     class Footer:
-        startIndex: int
-        chunkSize: int
-        chunksInFile: int = 0
-        lastIndex: int = 0
+        startIndex: int             # First index in THIS file
+        chunkSize: int              # Size of the chunks
+        chunksInFile: int = 0       # Number of chunks in THIS file
+        firstIndex: int = 0         # Absolute start of the entire log
+        lastIndex: int = 0          # Absolute end of the entire log
+        sequence: int = 1           # Number of this file among all
         offsets: list[int] = field(default_factory=list)
 
     filename = "transactions"
 
-    def __init__(self, path, chunk_size=1000):
+    def __init__(self, path, chunk_size=100):
         self.path = path
         self.chunk_size = chunk_size
 
     @property
     def _footer_size(self):
-        return struct.calcsize("!I") 
+        return struct.calcsize("!I")
 
     def _read_footer(self, open_file):
         open_file.seek(-self._footer_size, os.SEEK_END)
@@ -56,7 +60,27 @@ class LogStorageBackend:
         open_file.seek(footer_offset, os.SEEK_SET)
         return pickle.load(open_file), footer_offset
 
-    def save(self, transactions: Iterable, starting=0, start_index=0):
+    def save(self, transactions: Iterable, starting=0, start_index=0,
+        first_index=1):
+        """
+        Write the transactions out to disk.
+
+        Parameters:
+        transactions: iterable[LogEntry]
+            The transaction to be written. Note the iterable must support
+            slicing.
+        starting: int = 0
+            The first item to actually be written
+        start_index: int = 0
+            The absolute index of the first item in the transactions list. This
+            would generally be if the list were truncated after application.
+            When writing, the complete transaction list is no longer available
+            nor provided to this method.
+        first_index: int = 1
+            The absolut first index of the transaction log on disk. If the log
+            was compacted and the stored log starts from some point after index
+            1, this would be that index.
+        """
         # TODO: Consider making the operation atomic by copying the part of the
         # file to be kept to a new file and adding the new stuff to the end and
         # then moving it into place.
@@ -70,7 +94,7 @@ class LogStorageBackend:
         except FileNotFoundError:
             # XXX: The transaction log needs the concept of an offset/firstIndex
             # to support truncating for snapshots.
-            footer = self.Footer(startIndex=start_index,
+            footer = self.Footer(startIndex=first_index,
                 chunkSize=self.chunk_size, offsets=[0])
             footer_offset = 0
 
@@ -78,12 +102,16 @@ class LogStorageBackend:
         chunk_size = footer.chunkSize
         start_chunk = starting // chunk_size
         footer.chunksInFile = start_chunk
+        footer.firstIndex = first_index
+        footer.lastIndex = start_chunk * chunk_size
+        if (starting - start_index) % chunk_size > 0:
+            # Will actually have to back up into the previous chunk
+            pass
         if start_chunk < len(footer.offsets):
             start_offset = footer.offsets[start_chunk]
         else:
             # New chunk
             start_offset = footer_offset
-            footer.offsets.append(start_offset)
 
         # Truncate the file at the offset plus header size
         if os.path.exists(file_name):
@@ -91,14 +119,19 @@ class LogStorageBackend:
 
         # Write the chunks starting as requested
         starting -= starting % chunk_size
-        chunks = chunkize(transactions, chunk_size, starting=starting)
+        chunks = chunkize(transactions, chunk_size,
+            starting=starting, offset=start_index)
 
         with open(file_name, 'ab') as outfile:
             # (re)write new chunks
             outfile.seek(start_offset, os.SEEK_SET)
             for i, chunk in enumerate(chunks, start=start_chunk):
-                footer.offsets[i] = outfile.tell()
+                if start_chunk < len(footer.offsets):
+                    footer.offsets.append(start_offset)
+                else:
+                    footer.offsets[i] = outfile.tell()
                 footer.chunksInFile += 1
+                footer.lastIndex += len(chunk)
                 pickle.dump(chunk, outfile)
 
             # Now write the footer
@@ -111,12 +144,11 @@ class LogStorageBackend:
         elapsed = time.monotonic() - start
         log.debug(f"Updating log file took {elapsed:.3f}s")
 
-    def load(self, starting=0):
+    def load(self):
         """
         Yields "chunks" of the log file. The size of each chunk is configured by
         the ::chunk_size instance property.
         """
-        assert starting == 0
         file_path = os.path.join(self.path, self.filename)
         try:
             with open(file_path, "rb") as infile:
@@ -131,11 +163,45 @@ class LogStorageBackend:
         except FileNotFoundError:
             pass
 
-def chunkize(iterable, chunk_size, starting=0):
+    def load_partial(self, count, starting=0):
+        for chunk in iter_from_chunks(self.load(), count, starting):
+            yield from chunk
+
+    @lru_cache(maxsize=128)
+    def get(self, index):
+        entries = self.load_partial(1, index)
+        try:
+            return list(entries)[0]
+        except IndexError:
+            log.exception(f"Failed to load index {index}")
+            raise
+
+    def purge(self):
+        file_path = os.path.join(self.path, self.filename)
+        if os.path.exists(file_path):
+            os.unlink(file_path)
+
+def chunkize(iterable, chunk_size, starting=0, offset=0):
     l = len(iterable)
     # Adjust starting to start at an even chunk_size offset
     starting -= starting % chunk_size
-    start = starting
+    start = starting - offset
     while start < l:
         yield iterable[start:start+chunk_size]
         start += chunk_size
+
+def iter_from_chunks(chunks, count=None, start_offset=0):
+    for chunk in chunks:
+        if start_offset > 0:
+            if start_offset < len(chunk):
+                if count:
+                    yield (C := chunk[start_offset:start_offset+count])
+                    count -= len(C)
+                else:
+                    yield chunk[start_offset:]
+            start_offset -= len(chunk)
+        elif count and count > 0:
+            yield chunk[:count]
+            count -= len(chunk)
+        else:
+            yield chunk

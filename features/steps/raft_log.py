@@ -34,7 +34,7 @@ def add_entry_with_term_and_index(context, n, term, prev_index):
         prev_term = context.log.get(prev_index).term
 
     context.last_append = context.log.append_entries(
-        [LogEntry(int(term), ('ignored', 'command')) for _ in range(1, int(n) + 1)],
+        [LogEntry(int(term), ('ignored', 'cmd', i)) for i in range(1, int(n) + 1)],
         prev_index, prev_term
     )
 
@@ -46,17 +46,21 @@ def step_impl(context, n, term):
 
 @then('appendResult == {result}')
 def step_impl(context, result):
-    print(context.last_append, result)
     assert context.last_append == (result == 'True')
 
 @then('there are {n} items in the log')
 def step_impl(context, n):
-    print(len(context.log))
     assert len(context.log) == int(n)
 
 @then('the log will have terms {terms}')
 def step_impl(context, terms):
     for E, t in zip(context.log, terms.split(",")):
+        assert int(t) == E.term
+    
+@then('node {n} will have log terms {terms}')
+def step_impl(context, n, terms):
+    server = context.servers[int(n)]
+    for E, t in zip(server.log, terms.split(',')):
         assert int(t) == E.term
 
 @when(u'an log entry with "{content}" is added to the cluster log')
@@ -81,3 +85,15 @@ async def step_impl(context, n):
         )
 
     assert context.leader.commitIndex >= n
+
+@when('the log is truncated before {n}')
+def step_impl(context, n):
+    assert context.log.truncate_before(int(n))
+
+@then('the lastIndex is {n}')
+def step_impl(context, n):
+    assert context.log.lastIndex == int(n)
+
+@then('the startIndex is {n}')
+def step_impl(context, n):
+    assert context.log.start_index == int(n)

@@ -1,10 +1,10 @@
 import asyncio
 import random
 import time
+from typing import Type
 
 from .exception import NewTermError
 from .messages import Message, AppendEntries, RequestVote
-from .server import RemoteServer
 from .util import complete_or_cancel
 
 import logging
@@ -114,7 +114,7 @@ class CandidateRole(Role):
         # Return the results of the vote
         return votes
 
-    async def request_vote(self, server: RemoteServer):
+    async def request_vote(self, server: Type['RemoteServer']):
         # Send a RequestVote message to the server and await the response
         lastIndex = self.local_server.log.lastIndex
         if lastIndex == 0:
@@ -180,20 +180,25 @@ class LeaderRole(Role):
                 if len(local.log):
                     if local.currentTerm == local.log.lastEntry.term:
                         await local.advanceCommitIndex(local.cluster.lastCommitIndex())
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, NewTermError):
             raise
         except:
             log.exception("Error in server sync task")
             raise
 
-    async def sync_server(self, server):
+    async def sync_server(self, server: Type['RemoteServer']):
         """
         Remote server (follower) synchronization protocol.
+
+        Parameters:
+        server: RemoteServer
+            The remote server in the cluster which should receive the
+            AppendEntry messages.
         """
         # Assume the remote server is at the same place in its logs are the
-        # local server, and that we have no idea as to the state of the remote
-        # server's log. This will result in the first message having empty
-        # entries array which is what Raft requires.
+        # local server, but that we have no idea as to the actual state of the
+        # remote server's log. This will result in the first message having
+        # empty entries array which is what Raft requires.
         local = self.local_server
         nextIndex = local.log.lastIndex + 1
         heartbeat_time = min_heartbeat_time = self.heartbeat_time
@@ -261,10 +266,12 @@ class LeaderRole(Role):
 
             if response.success == True:
                 nextIndex += len(entries)
-                entryCount = max(entryCount + 1, self.max_entry_count)
+                entryCount = min(entryCount + 1, self.max_entry_count)
             else:
-                nextIndex -= 1
+                nextIndex = min(nextIndex - 1, response.matchIndex)
                 entryCount = max(entryCount - 1, 1)
+
+            # TODO: Impose a minimum wait time between packets
 
             # If the server is not yet caught up, then keep sending more packets
             if local.log.lastIndex >= nextIndex:
@@ -284,3 +291,6 @@ class LeaderRole(Role):
                 )
             except asyncio.TimeoutError:
                 pass
+
+# Circular dependency imports
+from .server import RemoteServer

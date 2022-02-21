@@ -155,6 +155,9 @@ async def raft_kvserver(host='localhost', port=12347, db_path="/tmp/kvstore.db",
                 except OSError:
                     # Sometimes this happens when switching leaders
                     pass
+                await asyncio.sleep(0.1)
+            else:
+                log.error("Unable to start application")
         elif server:
             print("No longer the leader. Shutting down application")
             server.close()

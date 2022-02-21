@@ -82,6 +82,14 @@ async def step_impl(context, n, term):
 async def step_impl(context):
     await asyncio.sleep(0.10)
 
+@when('node {n} is restarted')
+@async_step
+async def step_impl(context, n):
+    node = context.servers[int(n)]
+    node.shutdown()
+    node.log.purge()
+    await node.start()
+
 @then('the last entry in all nodes is ({term}, {index})')
 @async_step
 async def step_impl(context, term, index):
