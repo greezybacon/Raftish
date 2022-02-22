@@ -26,11 +26,6 @@ class LogBase(list):
     represents the first items and so on.
     """
     def __init__(self):
-        """
-        Parameters:
-        disk_path: str
-            Folder where the files for the transaction log are stored.
-        """
         self.lastApplied = 0
         self.start_index = 1
         self.apply_callbacks = set()
@@ -164,6 +159,10 @@ class LogBase(list):
             if self.lastApplied % 10 == 1:
                 await asyncio.sleep(0)
 
+        # Only keep the 1000-1500 records in memory
+        if self.lastApplied - self.start_index > 1500:
+            self.truncate_before(self.lastApplied - 1000)
+
         return True
 
     async def apply(self, index):
@@ -248,9 +247,9 @@ class TransactionLog(LogBase):
 
     def since_from_archive(self, index, max_entries=10):
         # Disk-backed log currently always starts from 1
-        log.info(f"Loading logs from disk, @{index}+{max_entries}")
         entries = self.storage.load_partial(count=max_entries, starting=index)
         return list(entries)
 
     def purge(self):
+        self.clear()
         return self.storage.purge()

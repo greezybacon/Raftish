@@ -149,7 +149,7 @@ class LeaderRole(Role):
     async def initiate(self):
         # Start tasks to send heartbeats to all the cluster members
         local = self.local_server
-        self.server_tasks = [
+        server_tasks = [
             asyncio.create_task(self.sync_server(server))
             for server in local.cluster.remote_servers
         ]
@@ -162,10 +162,10 @@ class LeaderRole(Role):
                 # Also wait for exceptions from any of the sync tasks
                 with complete_or_cancel((
                     self.sync_event.wait(),
-                )) as tasks:
+                )) as events:
                     for task in asyncio.as_completed((
-                        *tasks,
-                        *self.server_tasks
+                        *events,
+                        *server_tasks
                     )):
                         # Look for first completed or exception
                         await task
@@ -221,10 +221,11 @@ class LeaderRole(Role):
             elif prevIndex < local.log.lastIndex:
                 previousTerm = local.log.get(prevIndex).term
             else:
-                # Logs are synced, so send the term of the most
+                # Logs are synced, so send the term of the most recent entry in
+                # the local log
                 previousTerm = local.log.lastEntry.term
 
-            # Calculate round-trip time to back out of timeout below
+            # Calculate round-trip time to back out of wait time below
             start = time.monotonic()
             try:
                 response = await server.transceive(

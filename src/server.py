@@ -3,9 +3,6 @@ from inspect import ClosureVars
 import time
 
 import logging
-logging.basicConfig(level=logging.INFO,
-    format="%(relativeCreated)d: %(levelname)s:%(name)s:%(message)s"
-)
 log = logging.getLogger('servers')
 
 async def timeserver(host='localhost', port=12345):
@@ -146,7 +143,7 @@ async def raft_kvserver(host='localhost', port=12347, db_path="/tmp/kvstore.db",
 
         if app.local_server.is_leader():
             print("Local system is the leader. Starting the application")
-            for _ in range(10):
+            for _ in range(100):
                 try:
                     server = await app.start_server((host, port))
                     await server.start_serving()
@@ -184,6 +181,10 @@ parser.add_argument("--raft-port", help="Base listen port for Raft. The local-id
 parser.add_argument("--cluster-size", help="Size of the Raft cluster", type=int)
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO,
+        format="%(relativeCreated)d: %(levelname)s:%(name)s:%(message)s"
+    )
+
     args = parser.parse_args()
     params = {k: v for k, v in args._get_kwargs() if v is not None and k != 'server'}
     asyncio.run(servers[args.server](**params))

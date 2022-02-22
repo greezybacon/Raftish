@@ -63,6 +63,8 @@ def step_impl(context, n, terms):
     for E, t in zip(server.log, terms.split(',')):
         assert int(t) == E.term
 
+    assert len(server.log) == len(terms) 
+
 @when(u'an log entry with "{content}" is added to the cluster log')
 def step_impl(context, content):
     local_server = context.leader
@@ -88,7 +90,12 @@ async def step_impl(context, n):
 
 @when('the log is truncated before {n}')
 def step_impl(context, n):
-    assert context.log.truncate_before(int(n))
+    l = len(context.log)
+    lastIndex = context.log.lastIndex
+    context.log.truncate_before(int(n))
+    assert context.log.start_index == int(n)
+    assert context.log.lastIndex == lastIndex
+    assert len(context.log) + int(n) - 1 == l
 
 @then('the lastIndex is {n}')
 def step_impl(context, n):

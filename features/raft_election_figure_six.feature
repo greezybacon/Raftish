@@ -1,6 +1,6 @@
 Feature: Leaders are elected as expected
 
-    Background:
+    Background: Set the log up according to Figure 6
         Given a cluster of 5 nodes
           And the following log states
             """

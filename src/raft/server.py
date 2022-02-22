@@ -9,7 +9,6 @@ import pickle
 from .exception import LocalAppendFailed, NewTermError, DeadlockError, NotALeader
 from .log import TransactionLog
 from .messages import Message, Response, WaitList
-from .util import wait_for
 
 import logging
 log = logging.getLogger('raft.server')

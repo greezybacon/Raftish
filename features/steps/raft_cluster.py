@@ -80,7 +80,14 @@ async def step_impl(context, n, term):
 @when('the leader has replicated its logs to all nodes')
 @async_step
 async def step_impl(context):
-    await asyncio.sleep(0.10)
+    bt = context.clusters[0].config.broadcast_timeout
+    for _ in range(20):
+        await asyncio.sleep(bt)
+        log_len = [len(server.log) for server in context.servers]
+        if min(log_len) == max(log_len):
+            break
+    else:
+        assert False
 
 @when('node {n} is restarted')
 @async_step

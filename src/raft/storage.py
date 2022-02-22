@@ -4,8 +4,7 @@ import os, os.path
 import pickle
 import struct
 import time
-from tracemalloc import start
-from typing import Iterable
+from typing import Iterable, Type
 
 import logging
 log = logging.getLogger('raft.storage')
@@ -109,6 +108,7 @@ class LogStorageBackend:
             pass
         if start_chunk < len(footer.offsets):
             start_offset = footer.offsets[start_chunk]
+            del footer.offsets[start_chunk:]
         else:
             # New chunk
             start_offset = footer_offset
@@ -126,8 +126,8 @@ class LogStorageBackend:
             # (re)write new chunks
             outfile.seek(start_offset, os.SEEK_SET)
             for i, chunk in enumerate(chunks, start=start_chunk):
-                if start_chunk < len(footer.offsets):
-                    footer.offsets.append(start_offset)
+                if start_chunk <= len(footer.offsets):
+                    footer.offsets.append(outfile.tell())
                 else:
                     footer.offsets[i] = outfile.tell()
                 footer.chunksInFile += 1
@@ -144,27 +144,42 @@ class LogStorageBackend:
         elapsed = time.monotonic() - start
         log.debug(f"Updating log file took {elapsed:.3f}s")
 
-    def load(self):
+    def load(self, starting: int=0):
         """
         Yields "chunks" of the log file. The size of each chunk is configured by
         the ::chunk_size instance property.
         """
+        if starting < 0:
+            raise ValueError('`starting` value cannot be negatie')
+
         file_path = os.path.join(self.path, self.filename)
         try:
             with open(file_path, "rb") as infile:
-                log.info(f"Loading transaction log from file {file_path}")
+                # Skip to the chunk where `starting` offset can be found
+                if starting > 0:
+                    footer, _ = self._read_footer(infile)
+                    start_chunk = starting // footer.chunkSize
+                    starting = starting % footer.chunkSize
+                    infile.seek(footer.offsets[start_chunk], os.SEEK_SET)
+
                 # Skip the header
                 while True:
                     chunk = pickle.load(infile)
                     # The footer represents the end of the file
                     if type(chunk) is self.Footer:
                         break
-                    yield chunk
+                    if starting:
+                        yield chunk[starting:]
+                        starting = 0
+                    else:
+                        yield chunk
         except FileNotFoundError:
             pass
 
     def load_partial(self, count, starting=0):
-        for chunk in iter_from_chunks(self.load(), count, starting):
+        # TODO: Fast-forward the load process to skip to the first chunk with
+        # <starting>
+        for chunk in iter_from_chunks(self.load(starting), count):
             yield from chunk
 
     @lru_cache(maxsize=128)
@@ -200,8 +215,10 @@ def iter_from_chunks(chunks, count=None, start_offset=0):
                 else:
                     yield chunk[start_offset:]
             start_offset -= len(chunk)
-        elif count and count > 0:
+        elif count:
             yield chunk[:count]
             count -= len(chunk)
         else:
             yield chunk
+        if count <= 0:
+            break

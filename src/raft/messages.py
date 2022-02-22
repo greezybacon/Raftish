@@ -48,6 +48,7 @@ class Message:
 
     async def _send(self, id, socket, destination):
         message = pickle.dumps(self)
+        assert len(message) < 1300
         await socket.send(
             struct.pack("!II", len(message), id) + message,
             destination)
