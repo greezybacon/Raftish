@@ -272,15 +272,16 @@ class LeaderRole(Role):
                 nextIndex = min(nextIndex - 1, response.matchIndex)
                 entryCount = max(entryCount - 1, 1)
 
+            server.state.matchIndex = response.matchIndex
+            server.state.nextIndex = nextIndex
+            self.sync_event.set()
+
             # TODO: Impose a minimum wait time between packets
+            await asyncio.sleep(0.005)
 
             # If the server is not yet caught up, then keep sending more packets
             if local.log.lastIndex >= nextIndex:
                 continue
-
-            server.state.matchIndex = response.matchIndex
-            server.state.nextIndex = nextIndex
-            self.sync_event.set()
 
             # Wait for either the idle timeout or a new append entry request to
             # be broadcast.

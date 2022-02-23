@@ -61,7 +61,8 @@ async def step_impl(context):
     context.leader = context.servers[0]
 
 @given('the following log states')
-def step_impl(context):
+@async_step
+async def step_impl(context):
     for node, log in enumerate(context.text.split("\n")):
         for idx, term in enumerate(log.split(",")):
             context.servers[node].log.append(LogEntry(int(term), f'junk{idx}'))

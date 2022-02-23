@@ -10,7 +10,8 @@ def step_impl(context):
     context.log = TransactionLog(None)
 
 @given('a raft log with terms {term_list}')
-def step_impl(context, term_list):
+@async_step
+async def step_impl(context, term_list):
     context.log = TransactionLog(None)
     context.log.append_entries([
         LogEntry(term=int(t), value="initial")
@@ -21,7 +22,8 @@ def step_impl(context, term_list):
 @when('adding {n} random entry with term={term} and prev_index={prev_index}')
 @when('adding {n} random entries with term={term} and prev_index={prev_index}')
 @when('adding {n} entry with term={term} at index={prev_index}')
-def add_entry_with_term_and_index(context, n, term, prev_index):
+@async_step
+async def add_entry_with_term_and_index(context, n, term, prev_index):
     if type(prev_index) is str:
         prev_index = int(prev_index)
 
@@ -66,7 +68,8 @@ def step_impl(context, n, terms):
     assert len(server.log) == len(terms) 
 
 @when(u'an log entry with "{content}" is added to the cluster log')
-def step_impl(context, content):
+@async_step
+async def step_impl(context, content):
     local_server = context.leader
     assert local_server.is_leader()
 

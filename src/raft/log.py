@@ -68,7 +68,7 @@ class LogBase(list):
             # If there are existing log entries at the specified position, but
             # they are from a different term, then the existing entry and
             # everything that follows it needs to be deleted.
-            if previousIndex < self.lastIndex:
+            if 0 < previousIndex < self.lastIndex:
                 for index, entry in zip(range(previousIndex, self.lastIndex+1), entries):
                     # NOTE This is checking for REPLACING an entry which would
                     # mean to check the entry AFTER the previousIndex
@@ -217,17 +217,13 @@ class TransactionLog(LogBase):
         self.disk_path = os.path.join(disk_path or '.')
         self.storage = LogStorageBackend(self.disk_path)
 
-    async def load(self):
-        for chunk in self.storage.load():
-            log.info(f"Loading {len(chunk)} items from disk")
-            self.extend(chunk)
-
     def save(self, starting=0):
         # When saving, ensure the log entries to be saved are offset by the
         # starting index of this log
         self.storage.save(self, starting, self.start_index - 1)
 
     async def load(self):
+        await self.storage.startup()
         for chunk in self.storage.load():
             log.info(f"Loading {len(chunk)} items from disk")
             self.extend(chunk)
