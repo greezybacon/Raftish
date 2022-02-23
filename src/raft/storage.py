@@ -138,11 +138,13 @@ class LogStorageBackend:
 
         # What chunk do we want to start writing
         chunk_size = footer.chunkSize
-        start_chunk = (starting - first_index) // chunk_size
+        start_chunk = (starting - first_index + 1) // chunk_size
         footer.chunksInFile = start_chunk
         footer.firstIndex = first_index
         footer.lastIndex = start_chunk * chunk_size
 
+        # Truncate the chunk offsets if replacing a chunk before the end. (The
+        # file will be truncated below.)
         if start_chunk < len(footer.offsets):
             start_offset = footer.offsets[start_chunk]
             del footer.offsets[start_chunk:]
@@ -150,17 +152,20 @@ class LogStorageBackend:
             # New chunk
             start_offset = footer_offset
 
+        # If the write starts in the middle of a chunk, load the current chunk
+        # so the new data can be placed in it.
+        offset = (starting - first_index + 1) % chunk_size
+        if offset != 0:
+            last_chunk = next(self.load_partial(chunk_size, starting - offset))
+
         # Truncate the file at the offset plus header size
         if os.path.exists(file_name):
             os.truncate(file_name, start_offset)
 
         # Write the chunks starting as requested
-        starting -= starting % chunk_size
-        chunks = chunkize(transactions, chunk_size,
-            starting=0, offset=start_index)
+        chunks = chunkize(transactions, chunk_size, chunk_size - offset)
 
         with open(file_name, 'ab') as outfile:
-            # (re)write new chunks
             outfile.seek(start_offset, os.SEEK_SET)
             for i, chunk in enumerate(chunks, start=start_chunk):
                 if start_chunk <= len(footer.offsets):
@@ -169,6 +174,13 @@ class LogStorageBackend:
                     footer.offsets[i] = outfile.tell()
                 footer.chunksInFile += 1
                 footer.lastIndex += len(chunk)
+
+                # Rewrite the last chunk of the file to include the new edit
+                if offset != 0:
+                    log.info(f"Updating the last chunk @{offset}, adding {len(chunk)} items")
+                    last_chunk[offset:] = chunk
+                    chunk = last_chunk
+                    offset = 0
                 pickle.dump(chunk, outfile)
 
             # Now write the footer
@@ -192,7 +204,7 @@ class LogStorageBackend:
             beginning of the log on disk)
         """
         if starting < 0:
-            raise ValueError('`starting` value cannot be negatie')
+            raise ValueError('`starting` value cannot be negative')
 
         file_path = self.fullpath
         try:
@@ -221,14 +233,14 @@ class LogStorageBackend:
         # Fast-forward the load process to skip to the first chunk with
         # <starting>
         for chunk in iter_from_chunks(self.load(starting), count):
-            yield from chunk
+            yield chunk
 
     @lru_cache(maxsize=128)
     def get(self, index):
         try:
-            entries = self.load_partial(1, index)
-            return list(entries)[0]
-        except IndexError:
+            for chunk in self.load_partial(1, index):
+                return chunk[0]
+        except StopIteration:
             # TODO: Attempt to fetch from WAL
             return self.wal.try_find(index)
 
@@ -237,14 +249,18 @@ class LogStorageBackend:
         if os.path.exists(file_path):
             os.unlink(file_path)
 
-def chunkize(iterable, chunk_size, starting=0, offset=0):
+def chunkize(iterable, chunk_size, first_chunk_size=None):
     l = len(iterable)
+    start = 0
     # Adjust starting to start at an even chunk_size offset
-    starting -= starting % chunk_size
-    start = starting - offset
     while start < l:
-        yield iterable[start:start+chunk_size]
-        start += chunk_size
+        if first_chunk_size:
+            yield iterable[:first_chunk_size]
+            start += first_chunk_size
+            first_chunk_size = None 
+        else:
+            yield iterable[start:start+chunk_size]
+            start += chunk_size
 
 def iter_from_chunks(chunks, count=None):
     for chunk in chunks:
