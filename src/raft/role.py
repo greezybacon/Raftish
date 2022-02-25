@@ -11,7 +11,7 @@ import logging
 log = logging.getLogger('raft.role')
 
 class Role:
-    def __init__(self, server):
+    def __init__(self, server: 'LocalServer'):
         self.local_server = server
 
     def inititate(self):
@@ -295,4 +295,4 @@ class LeaderRole(Role):
                 pass
 
 # Circular dependency imports
-from .server import RemoteServer
+from .server import LocalServer, RemoteServer

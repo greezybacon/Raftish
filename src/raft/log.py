@@ -243,8 +243,9 @@ class TransactionLog(LogBase):
 
     def since_from_archive(self, index, max_entries=10):
         # Disk-backed log currently always starts from 1
-        entries = self.storage.load_partial(count=max_entries, starting=index)
-        return list(entries)
+        # Just return the first chunk. count is max here--not a requirement
+        for chunk in self.storage.load_partial(count=max_entries, starting=index):
+            return chunk
 
     def purge(self):
         self.clear()

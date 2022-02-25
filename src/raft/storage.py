@@ -85,10 +85,7 @@ class LogStorageBackend:
     async def delay_flush(self, delay=5):
         try:
             await asyncio.sleep(delay)
-            # This doesn't need to be shielded because it's not async and so
-            # will not yield. So there'd be no opportunity to switch and cancel
-            await asyncio.shield(self.wal.replay(self))
-            self.wal.clear()
+            await self.wal.replay_and_clear(self)
         except asyncio.CancelledError:
             pass
         except:
@@ -284,6 +281,7 @@ class WriteAheadLog(list):
         items: tuple[object]    # The entries
 
     filename = "transactions.wal"
+    alt_filename = "transactions.wal2"
 
     def __init__(self, path, chunk_size):
         self.path = path
@@ -310,8 +308,20 @@ class WriteAheadLog(list):
             if i % 10 == 9:
                 await asyncio.sleep(0)
 
+    async def replay_and_clear(self, backend: LogStorageBackend):
+        size = len(self)
+        await self.replay(backend)
+        self.clear(up_through=size)
+
     def open(self, mode='ab'):
         return open(os.path.join(self.path, self.filename), mode)
+
+    def open_alt(self, mode='wb'):
+        return open(os.path.join(self.path, self.alt_filename), mode)
+
+    def commit_alt(self):
+        shutil.move(os.path.join(self.path, self.alt_filename),
+            os.path.join(self.path, self.filename))
 
     def extend(self, items, start_offset):
         with self.open() as walfile:
@@ -320,12 +330,22 @@ class WriteAheadLog(list):
                 items=tuple(items)
             )
             pickle.dump(entry, walfile)
-        super().append(entry)
+        self.append(entry)
 
-    def clear(self):
+    def clear(self, up_through=None):
+        if up_through is not None:
+            remainder = self[up_through:]
+
+        log.info(f"Clearing up through {up_through},{len(remainder)}")
         super().clear()
-        with self.open('wb'):
-            pass
+        with self.open_alt('wb') as walfile:
+            if up_through is not None and remainder:
+                for entry in remainder:
+                    pickle.dump(entry, walfile)
+                    self.append(entry)
+
+        log.info(f"Committiing ALT WAL file with {len(self)}")
+        self.commit_alt()
 
     def chunkize(self):
         """

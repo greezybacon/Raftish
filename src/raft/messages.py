@@ -43,7 +43,7 @@ class Message:
         self.ensure_id()
         await self._send(self.id, socket, destination)
 
-    async def respond_with(self, response: Type['Message'], socket, destination):
+    async def respond_with(self, response: 'Response', socket, destination):
         await response._send(self.id, socket, destination)
 
     async def _send(self, id, socket, destination):
@@ -136,6 +136,16 @@ class AppendEntries(Message):
             matchIndex=server.log.lastIndex)
 
 class WaitList(dict):
+    """
+    Simple object to be used by the RemoteServer instances to await a response
+    to a message. Using Message::ensure_id(), an ID# is generated and sent with
+    the message. If the receiver uses Message::respond_with() to send a
+    response, the same ID# is returned in the response. This allows a
+    transactional model to be used for messaging and allows the sender to block
+    and wait for the response. It also allows keeping the response out of the
+    local servers receive queue and allows the sender to be freed from blocking
+    directly.
+    """
     max_lifetime = 10
 
     @dataclass
@@ -150,6 +160,29 @@ class WaitList(dict):
             return message
 
     async def wait_for(self, message: Message, timeout=None):
+        """
+        Await a response to the message. The LocalServer will receive the
+        response and use ::set_response to actually deliver the response and
+        free the waiter.
+
+        Parameters:
+        message: Message
+            The message which will be responded to in the near future. Must
+            already be sent with Message::send().
+        timeout: Optional[float] = None
+            The time to wait for response. If unspecified, the ::max_lifetime
+            property of the WaitList is used as the timeout.
+
+        Raises:
+        asyncio.TimeoutError
+            If the response in not received within the timeout specified. If the
+            timeout is not specified, the WaitList imposes a maximum lifetime of
+            the wait item in the list. It will inject TimeoutError into the
+            waiter task when the wait is abandoned.
+
+        Returns: Response
+        The response the the given message.
+        """
         log.debug(f"Starting wait for message {message.id}")
         item = self[message.id] = self.Item.for_message(message, timeout or self.max_lifetime)
         return await asyncio.wait_for(item.waiter, timeout=timeout)
