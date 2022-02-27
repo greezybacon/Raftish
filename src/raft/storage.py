@@ -174,7 +174,6 @@ class LogStorageBackend:
 
                 # Rewrite the last chunk of the file to include the new edit
                 if offset != 0:
-                    log.info(f"Updating the last chunk @{offset}, adding {len(chunk)} items")
                     last_chunk[offset:] = chunk
                     chunk = last_chunk
                     offset = 0
@@ -210,6 +209,8 @@ class LogStorageBackend:
                 if starting > 0:
                     footer, _ = self._read_footer(infile)
                     start_chunk = starting // footer.chunkSize
+                    if start_chunk >= len(footer.offsets):
+                        raise ValueError("`starting` value beyond end of log")
                     starting = starting % footer.chunkSize
                     infile.seek(footer.offsets[start_chunk], os.SEEK_SET)
 
@@ -226,7 +227,7 @@ class LogStorageBackend:
         except FileNotFoundError:
             pass
 
-    def load_partial(self, count, starting=0):
+    def load_partial(self, count: int, starting: int=0):
         # Fast-forward the load process to skip to the first chunk with
         # <starting>
         for chunk in iter_from_chunks(self.load(starting), count):
@@ -237,7 +238,8 @@ class LogStorageBackend:
         try:
             for chunk in self.load_partial(1, index):
                 return chunk[0]
-        except StopIteration:
+        except IndexError:
+            log.info(f"Log doesn't have entry at offset {index}. Searching WAL")
             # TODO: Attempt to fetch from WAL
             return self.wal.try_find(index)
 
@@ -294,7 +296,7 @@ class WriteAheadLog(list):
             with self.open('rb') as walfile:
                 try:
                     while True:
-                        super().append(pickle.load(walfile))
+                        self.append(pickle.load(walfile))
                 except EOFError:
                     pass
             await self.replay(backend)
@@ -336,7 +338,6 @@ class WriteAheadLog(list):
         if up_through is not None:
             remainder = self[up_through:]
 
-        log.info(f"Clearing up through {up_through},{len(remainder)}")
         super().clear()
         with self.open_alt('wb') as walfile:
             if up_through is not None and remainder:
@@ -344,7 +345,6 @@ class WriteAheadLog(list):
                     pickle.dump(entry, walfile)
                     self.append(entry)
 
-        log.info(f"Committiing ALT WAL file with {len(self)}")
         self.commit_alt()
 
     def chunkize(self):

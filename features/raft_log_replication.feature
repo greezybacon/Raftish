@@ -14,7 +14,7 @@ Feature: Raft can replicate log entries
             1
             1
             """
-         When node 0 becomes the leader for term 1 
+         When node 0 becomes the leader for term 7 
           And the leader has replicated its logs to all nodes
           And node 1 will have log terms 1,1,1,4,4,5,5,6,6,6,6,6
           And node 1 is restarted

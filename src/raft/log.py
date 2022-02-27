@@ -136,6 +136,7 @@ class LogBase(list):
         return self.get(start)
 
     def add_apply_callback(self, callback):
+        assert callable(callback)
         self.apply_callbacks.add(callback)
 
     async def apply_up_to(self, index, max_entries=500):

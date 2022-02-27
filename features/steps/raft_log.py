@@ -48,30 +48,35 @@ def step_impl(context, n, term):
 
 @then('appendResult == {result}')
 def step_impl(context, result):
-    assert context.last_append == (result == 'True')
+    assert context.last_append == (result.upper() == 'TRUE')
 
 @then('there are {n} items in the log')
 def step_impl(context, n):
-    assert len(context.log) == int(n)
+    assert len(context.log) == int(n), \
+        f"The log as {len(context.log)} items"
 
 @then('the log will have terms {terms}')
 def step_impl(context, terms):
     for E, t in zip(context.log, terms.split(",")):
         assert int(t) == E.term
     
+@when('node {n} will have log terms {terms}')
 @then('node {n} will have log terms {terms}')
 def step_impl(context, n, terms):
     server = context.servers[int(n)]
-    for E, t in zip(server.log, terms.split(',')):
+    terms = terms.split(',')
+    for E, t in zip(server.log, terms):
         assert int(t) == E.term
 
-    assert len(server.log) == len(terms) 
+    assert len(server.log) == len(terms), \
+        f"The log has {len(server.log)} entries" 
 
 @when(u'an log entry with "{content}" is added to the cluster log')
 @async_step
 async def step_impl(context, content):
     local_server = context.leader
-    assert local_server.is_leader()
+    assert local_server.is_leader(), \
+        f"Server has role {local_server.role}"
 
     local_server.append_entry(LogEntry(
         term=local_server.currentTerm,

@@ -1,12 +1,14 @@
 import asyncio
-import time
-from typing import Type
 import asyncio_dgram
 from dataclasses import dataclass
 import os, os.path
 import pickle
+import tempfile
 
-from .exception import LocalAppendFailed, NewTermError, DeadlockError, NotALeader
+from .exception import (
+    LocalAppendFailed, NewTermError, DeadlockError, NotALeader,
+    TheresAnotherLeader
+)
 from .log import TransactionLog
 from .messages import Message, Response, WaitList
 
@@ -17,7 +19,6 @@ class LocalServer:
     def __init__(self, id: str, listen_address: tuple[str, int], cluster):
         self._id = id
         self._cluster = cluster
-        self.storage_path = cluster.config.get_storage_path()
         
         # Messaging
         self.socket_lock = asyncio.Lock()
@@ -28,6 +29,11 @@ class LocalServer:
 
         # Persistent state
         self.config = None
+        if cluster:
+            self.storage_path = cluster.config.get_storage_path()
+        else:
+            self.storage_location = tempfile.TemporaryDirectory("raft")
+            self.storage_path = self.storage_location.name
         self.load_config(self.storage_path)
         
         # Volatile state
@@ -54,13 +60,6 @@ class LocalServer:
         # Load the log from disk
         await self.log.load()
 
-        # Open a socket and handle messages
-        self.comm_tasks = [
-            asyncio.create_task(self.receive_messages()),
-            asyncio.create_task(self.send_messages()),
-            asyncio.create_task(self.handle_messages())
-        ]
-
         # Start as a follower
         await self.become_follower()
 
@@ -69,6 +68,13 @@ class LocalServer:
             await server.start(self)
 
         await self.ensure_dgram_endpoint()
+
+        # Open a socket and handle messages
+        self.comm_tasks = [
+            asyncio.create_task(self.receive_messages()),
+            asyncio.create_task(self.send_messages()),
+            asyncio.create_task(self.handle_messages())
+        ]
 
     def shutdown(self):
         self.role_task.cancel()
@@ -101,9 +107,9 @@ class LocalServer:
             self.role = None
             await self.switch_role(FollowerRole)
 
-    async def do_role(self, next_role: Type["Role"]):
-        try:
-            while True:
+    async def do_role(self, next_role: "Role"):
+        while True:
+            try:
                 log.info(f"{self.id}: Switching to {next_role} role")
                 self.role = next_role(self)
                 self.role_changed.set()
@@ -111,14 +117,16 @@ class LocalServer:
                 next_role = await self.role.initiate()
                 if next_role is None:
                     raise DeadlockError("Role task returned but did not specify next role")
-        except NewTermError as e:
-            await asyncio.shield(
-                self.handle_new_term_error(e, must_switch=True))
-        except asyncio.CancelledError:
-            # Happens when switching roles
-            pass
-
-        self.role = None
+            except TheresAnotherLeader:
+                next_role = FollowerRole
+            except NewTermError as e:
+                next_role = FollowerRole
+                self.config.currentTerm = e.term
+            except asyncio.CancelledError:
+                break
+            except:
+                log.exception("Critical error in server role. Reverting to Follower")
+                next_role = FollowerRole
 
     @property
     def commitIndex(self):
@@ -176,58 +184,51 @@ class LocalServer:
     # Networking ------
 
     async def ensure_dgram_endpoint(self):
-        async with self.socket_lock:
-            if not hasattr(self, 'socket'):
-                self.socket = await asyncio_dgram.bind(self.listen_address)
-                log.info(f"Listening on {self.listen_address}")
+        if not hasattr(self, 'socket'):
+            self.socket = await asyncio_dgram.bind(self.listen_address)
+            log.info(f"Listening on {self.listen_address}")
 
     async def send_messages(self):
-        await self.ensure_dgram_endpoint()
         while True:
             message, dest_addr = await self.out_queue.get()
             await message.send(self.socket, dest_addr)
         
     async def receive_messages(self):
-        await self.ensure_dgram_endpoint()
-        try:
-            while True:
-                message, sender = await self.socket.recv()
-                message = Message.from_bytes(message)
-                if isinstance(message, Response):
-                    # Looks like a response. See if a message is waiting on it.
-                    self.wait_list.set_response(message)
-                else:
-                    # Message is a request for the local server node
-                    await self.in_queue.put((message, sender))
-        except asyncio.CancelledError:
-            # Server is shutting down
-            pass
+        while True:
+            message, sender = await self.socket.recv()
+            message = Message.from_bytes(message)
+            if isinstance(message, Response):
+                # Looks like a response. See if a message is waiting on it.
+                self.wait_list.set_response(message)
+            else:
+                # Message is a request for the local server node
+                await self.in_queue.put((message, sender))
             
     async def handle_messages(self):
         # Messages will be handled here when the server is a follower. In
         # Candidate and Leader roles, the RemoteServer objects will be used to
         # send and receive messages.
-        try:
-            while True:
-                response = False
-                try:
-                    message, sender = await self.in_queue.get()
-                    response = await self.role.handle_message(message, sender)
-                except NewTermError as e:
-                    # The incoming message indicates a new sherrif in town. Demote
-                    # to follower
-                    await self.handle_new_term_error(e)
+        while True:
+            response = False
+            try:
+                message, sender = await self.in_queue.get()
+                response = await self.role.handle_message(message, sender)
+            except NewTermError as e:
+                if not self.is_follower():
+                    await self.switch_role(FollowerRole)
+                self.config.currentTerm = e.term
+                # Try the response again with the new term
+                response = await self.role.handle_message(message, sender)
+            except TheresAnotherLeader:
+                await self.switch_role(FollowerRole)
+            except asyncio.CancelledError:
+                break
+            except:
+                log.exception("Trouble handling message")
 
-                    # Try the message again with the new term
-                    response = await self.role.handle_message(message, sender)
-
-                if response:
-                    await message.respond_with(response, self.socket, sender)
-        except asyncio.CancelledError:
-            # Server is shutting down
-            pass
-        except:
-            log.exception("oops")
+            if response:
+                response.set_id(message)
+                await self.out_queue.put((response, sender))
 
 class LocalState:
     """
@@ -259,7 +260,8 @@ class LocalState:
 
     @currentTerm.setter
     def currentTerm(self, value):
-        assert value >= self._config.term
+        assert value >= self._config.term, \
+            f'Cowardly refusing to roll currentTerm from {self._config.term} to {value}'
         self._config.term = value
         self._config.votedFor = None
         self._sync()

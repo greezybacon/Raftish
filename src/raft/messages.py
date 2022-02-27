@@ -54,9 +54,11 @@ class Message:
             destination)
 
     async def handle(self, server, sender):
-        pass
+        raise NotImplemented
 
-class Response(Message): pass
+class Response(Message):
+    def set_id(self, message: Message):
+        self.id = message.id
 
 @dataclass
 class RequestVote(Message):
@@ -114,11 +116,18 @@ class AppendEntries(Message):
     class Response(Response):
         term: int
         success: bool
-        matchIndex: int
+        matchIndex: int = 0
 
     async def handle(self, server, sender) -> Response:
         if self.term > server.currentTerm:
             raise NewTermError(self.term)
+
+        if self.term < server.currentTerm:
+            # Reject the message
+            return self.Response(term=server.currentTerm, success=False)
+
+        if not server.is_follower():
+            raise TheresAnotherLeader()
 
         # It's important to call ::append_entries here, even if entries is
         # empty, because the leader needs to know if new entries *could* be

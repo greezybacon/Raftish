@@ -5,7 +5,6 @@ from typing import Type
 
 from .exception import NewTermError
 from .messages import Message, AppendEntries, RequestVote
-from .util import complete_or_cancel
 
 import logging
 log = logging.getLogger('raft.role')
@@ -24,38 +23,32 @@ class Role:
         raise NotImplemented
 
     async def handle_message(self, message: Message, sender):
-        try:
-            return await message.handle(self.local_server, sender)
-        except asyncio.CancelledError:
-            # Node changed roles while processing the message. The message will
-            # have to be resent
-            pass
+        return await message.handle(self.local_server, sender)
 
 class FollowerRole(Role):
     def __init__(self, server):
         super().__init__(server)
         # Election timeout is between half and full election_timeout
-        split = server.cluster.config.election_timeout / 2
-        self.timeout_time = random.random() * split + split
-        self.message_event = asyncio.Condition()
+        self.timeout_time = server.cluster.config.election_timeout
+        self.message_event = asyncio.Event()
 
     async def initiate(self):
         # Await APPEND_ENTRIES message from the leader, request change to
         # CandidateRole if timed out
-        while True:
-            try:
-                async with self.message_event:
-                    await asyncio.wait_for(
-                        self.message_event.wait(),
-                        timeout=self.timeout_time)
-            except asyncio.TimeoutError:
-                # Suggest the server should transistion to the CandidateRole
-                return CandidateRole
+        try:
+            while True:
+                await asyncio.wait_for(
+                    self.message_event.wait(),
+                    timeout=self.timeout_time)
+                self.message_event.clear()
+        except asyncio.TimeoutError:
+            log.info("Got a timeout awaiting a message")
+            # Suggest the server should transistion to the CandidateRole
+            return CandidateRole
 
     async def handle_message(self, message: Message, sender):
         if type(message) is AppendEntries:
-            async with self.message_event:
-                self.message_event.notify()
+            self.message_event.set()
 
         return await super().handle_message(message, sender)
 
@@ -67,8 +60,10 @@ class CandidateRole(Role):
 
     async def initiate(self):
         votes_needed = self.local_server.cluster.quorum_count
-        wait_time = self.election_timeout
+        max_wait = self.election_timeout
+        half_wait = max_wait / 2
         while True:
+            wait_time = random.random() * half_wait + half_wait
             self.local_server.incrementTerm()
             start = time.monotonic()
             votes = await self.hold_election(wait_time, votes_needed)
@@ -81,8 +76,11 @@ class CandidateRole(Role):
             await asyncio.sleep(max(0, wait_time - elapsed))
 
     async def hold_election(self, wait_time, votes_needed):
-        log.info("Holding a new election")
-        votes = 1 # Vote for self
+        log.info(f"Holding a new election, wait_time := {wait_time:.3f}")
+        # Vote for self
+        self.local_server.voteFor(term=self.local_server.currentTerm,
+            candidate=self.local_server.id)
+        votes = 1
 
         constituants = [
             asyncio.ensure_future(self.request_vote(server))
@@ -114,7 +112,7 @@ class CandidateRole(Role):
         # Return the results of the vote
         return votes
 
-    async def request_vote(self, server: Type['RemoteServer']):
+    async def request_vote(self, server: 'RemoteServer'):
         # Send a RequestVote message to the server and await the response
         lastIndex = self.local_server.log.lastIndex
         if lastIndex == 0:
@@ -157,34 +155,25 @@ class LeaderRole(Role):
         # Watch the synchronization events and update the local server
         # commitIndex when the cluster reaches concensus on the appending of the
         # LogEntries.
-        try:
-            while True:
-                # Also wait for exceptions from any of the sync tasks
-                with complete_or_cancel((
-                    self.sync_event.wait(),
-                )) as events:
-                    for task in asyncio.as_completed((
-                        *events,
-                        *server_tasks
-                    )):
-                        # Look for first completed or exception
-                        await task
-                        break
+        while True:
+            # Also wait for exceptions from any of the sync tasks
+            for task in asyncio.as_completed((
+                self.sync_event.wait(),
+                *server_tasks
+            )):
+                # Look for first completed or exception
+                await task
+                break
 
-                self.sync_event.clear()
+            self.sync_event.clear()
 
-                # Advance the commitIndex; however, only items in the
-                # current leader's term can be used to advance the commit
-                # index. Once advanced. Then all previous entries are also
-                # committed.
-                if len(local.log):
-                    if local.currentTerm == local.log.lastEntry.term:
-                        await local.advanceCommitIndex(local.cluster.lastCommitIndex())
-        except (asyncio.CancelledError, NewTermError):
-            raise
-        except:
-            log.exception("Error in server sync task")
-            raise
+            # Advance the commitIndex; however, only items in the
+            # current leader's term can be used to advance the commit
+            # index. Once advanced. Then all previous entries are also
+            # committed.
+            if len(local.log):
+                if local.currentTerm == local.log.lastEntry.term:
+                    await local.advanceCommitIndex(local.cluster.lastCommitIndex())
 
     async def sync_server(self, server: Type['RemoteServer']):
         """
@@ -193,7 +182,7 @@ class LeaderRole(Role):
         Parameters:
         server: RemoteServer
             The remote server in the cluster which should receive the
-            AppendEntry messages.
+            AppendEntries messages.
         """
         # Assume the remote server is at the same place in its logs are the
         # local server, but that we have no idea as to the actual state of the
@@ -214,6 +203,7 @@ class LeaderRole(Role):
             # Fetch a list of entries AFTER (not including) the previous
             # entry
             entries = local.log.since(prevIndex, max_entries=entryCount)
+            assert len(entries) >= 0
 
             # Determine the TERM of the entry in the prevIndex slot
             if prevIndex == 0:
@@ -259,11 +249,6 @@ class LeaderRole(Role):
                 heartbeat_time = min_heartbeat_time
 
             server.state.lostMessages = 0
-
-            if response.term > local.currentTerm:
-                # Notify the main role task that the
-                log.error("OOPS: New sherrif in town")
-                raise NewTermError(response.term)
 
             if response.success == True:
                 nextIndex += len(entries)
