@@ -208,7 +208,10 @@ class LogEntry:
 
 
 class TransactionLog(LogBase):
-    def __init__(self, disk_path):
+    """
+    An extension to the LogBase which supports persistence.
+    """
+    def __init__(self, disk_path, persistence_backend=LogStorageBackend):
         """
         Parameters:
         disk_path: str
@@ -216,7 +219,7 @@ class TransactionLog(LogBase):
         """
         super().__init__()
         self.disk_path = os.path.join(disk_path or '.')
-        self.storage = LogStorageBackend(self.disk_path)
+        self.storage = persistence_backend(self.disk_path)
 
     def save(self, starting=0):
         # When saving, ensure the log entries to be saved are offset by the

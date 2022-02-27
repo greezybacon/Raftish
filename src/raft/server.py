@@ -101,12 +101,6 @@ class LocalServer:
         while type(self.role) is not new_role:
             await asyncio.sleep(0)
 
-    async def handle_new_term_error(self, error: NewTermError, must_switch=False):
-        self.config.currentTerm = error.term
-        if must_switch or not self.is_follower():
-            self.role = None
-            await self.switch_role(FollowerRole)
-
     async def do_role(self, next_role: "Role"):
         while True:
             try:

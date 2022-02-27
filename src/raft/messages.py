@@ -6,7 +6,7 @@ import struct
 import time
 from typing import Type
 
-from .exception import NewTermError
+from .exception import NewTermError, TheresAnotherLeader
 from .log import LogEntry
 
 import logging

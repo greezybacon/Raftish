@@ -5,6 +5,7 @@ from typing import Type
 
 from .exception import NewTermError
 from .messages import Message, AppendEntries, RequestVote
+from .util import cancelling
 
 import logging
 log = logging.getLogger('raft.role')
@@ -42,12 +43,11 @@ class FollowerRole(Role):
                     timeout=self.timeout_time)
                 self.message_event.clear()
         except asyncio.TimeoutError:
-            log.info("Got a timeout awaiting a message")
             # Suggest the server should transistion to the CandidateRole
             return CandidateRole
 
     async def handle_message(self, message: Message, sender):
-        if type(message) is AppendEntries:
+        if type(message) in (AppendEntries, RequestVote):
             self.message_event.set()
 
         return await super().handle_message(message, sender)
@@ -147,35 +147,36 @@ class LeaderRole(Role):
     async def initiate(self):
         # Start tasks to send heartbeats to all the cluster members
         local = self.local_server
-        server_tasks = [
-            asyncio.create_task(self.sync_server(server))
-            for server in local.cluster.remote_servers
-        ]
 
         # Watch the synchronization events and update the local server
         # commitIndex when the cluster reaches concensus on the appending of the
         # LogEntries.
-        while True:
-            # Also wait for exceptions from any of the sync tasks
-            for task in asyncio.as_completed((
-                self.sync_event.wait(),
-                *server_tasks
-            )):
-                # Look for first completed or exception
-                await task
-                break
 
-            self.sync_event.clear()
+        with cancelling(
+            asyncio.create_task(self.sync_server(server))
+            for server in local.cluster.remote_servers
+        ) as server_tasks:
+            while True:
+                # Also wait for exceptions from any of the sync tasks
+                for task in asyncio.as_completed((
+                    self.sync_event.wait(),
+                    *server_tasks
+                )):
+                    # Look for first completed or exception
+                    await task
+                    break
 
-            # Advance the commitIndex; however, only items in the
-            # current leader's term can be used to advance the commit
-            # index. Once advanced. Then all previous entries are also
-            # committed.
-            if len(local.log):
-                if local.currentTerm == local.log.lastEntry.term:
-                    await local.advanceCommitIndex(local.cluster.lastCommitIndex())
+                self.sync_event.clear()
 
-    async def sync_server(self, server: Type['RemoteServer']):
+                # Advance the commitIndex; however, only items in the
+                # current leader's term can be used to advance the commit
+                # index. Once advanced. Then all previous entries are also
+                # committed.
+                if len(local.log):
+                    if local.currentTerm == local.log.lastEntry.term:
+                        await local.advanceCommitIndex(local.cluster.lastCommitIndex())
+
+    async def sync_server(self, server: 'RemoteServer'):
         """
         Remote server (follower) synchronization protocol.
 

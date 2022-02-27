@@ -223,14 +223,15 @@ async def wait_for(aw, timeout, *, loop=None):
 asyncio.wait_for = wait_for
 
 @contextlib.contextmanager
-def complete_or_cancel(aws):
+def cancelling(aws):
     aws = {
         asyncio.ensure_future(x)
         for x in aws
     }
 
-    yield aws
-
-    for x in aws:
-        if not x.done():
-            x.cancel()
+    try:
+        yield aws
+    finally:
+        for x in aws:
+            if not x.done():
+                x.cancel()

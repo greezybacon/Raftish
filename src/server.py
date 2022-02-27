@@ -1,5 +1,4 @@
 import asyncio
-from inspect import ClosureVars
 import time
 
 import logging
