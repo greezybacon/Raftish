@@ -135,38 +135,9 @@ async def raft_kvserver(host='localhost', port=12347, db_path="/tmp/kvstore.db",
         ]
     }
 
-    async def run_server():
-        for _ in range(100):
-            try:
-                server = await app.start_server((host, port))
-                await server.start_serving()
-                print("Application is running")
-                break
-            except OSError:
-                # Sometimes this happens when switching leaders
-                pass
-            await asyncio.sleep(0.1)
-        else:
-            log.error("Unable to start application")
-
-        if app.local_server.is_leader():
-            await app.local_server.role_changed.wait()
-
-        print("No longer the leader. Shutting down application")
-        server.close()
-        await server.wait_closed()
-        print("Server shut down")
-
     await app.start_cluster(local_id, config=config)
-    while True:
-        server_task = None
-        await app.local_server.role_changed.wait()
+    await app.run((host, port))
 
-        if app.local_server.is_leader():
-            print("Local system is the leader. Starting the application")
-            if server_task and not server_task.done():
-                server_task.cancel()
-            server_task = asyncio.create_task(run_server())
 
 ### Command-line interface to run the servers
 

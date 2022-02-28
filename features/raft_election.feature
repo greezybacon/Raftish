@@ -15,7 +15,7 @@ Feature: Servers can elect a leader automatically among themselves
         Given a cluster of 3 nodes
          When node 0 becomes a candidate for term 2
           And node 1 becomes a candidate for term 2
-          And node 2 becomes a candidate for term 2
+          And node 2 becomes a candidate for term 3
          Then the cluster will have a leader
           And the cluster will have 2 followers
        

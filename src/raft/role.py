@@ -71,7 +71,8 @@ class CandidateRole(Role):
             if votes >= votes_needed:
                 return LeaderRole
 
-            # Wait the remainder of the election timeout
+            # Wait the remainder of the election timeout. Note this happens if
+            # the other nodes say NO.
             elapsed = time.monotonic() - start
             await asyncio.sleep(max(0, wait_time - elapsed))
 

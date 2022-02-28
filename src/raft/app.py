@@ -1,9 +1,14 @@
 import asyncio
+from typing import Optional
 
 from .cluster import Cluster
 from .config import ClusterConfig
 from .exception import NotALeader
 from .log import LogEntry
+from .util import _timeout as timeout
+
+import logging
+log = logging.getLogger('raft.app')
 
 class Application:
     """
@@ -12,15 +17,33 @@ class Application:
     items are then fed through the Raft cluster and, eventually, the ::commit
     method is called to actually apply the LogEntry to the state machine
     locally.
+
+    Usage:
+        class MyRaftBackedApp(raft.app.Application):
+            async def commit(self, message):
+                # Handle message sent through ::submit
+                ...
+
+            return True
+
+            async def handle_connection(self, reader, writer):
+                # Handle new client connections, start transactions through
+                # ::submit
+                ...
+
+        app = MyRaftBackedApp()
+        await app.start_cluter(local_id, config)
+        await app.run((host, port))
     
     Caveats:
     Note that ::commit is called for the application on *all* members of the
-    Raft cluster.
+    Raft cluster, for every transaction sent to ::submit.
     """
     async def start_cluster(self, local_id: str, disk_path: str=None,
-        config: object=None):
+        config: Optional[dict]=None):
         """
-        Start the Raft cluster for distributed replication and consensus.
+        Start the local server as part of the Raft cluster for distributed
+        replication and consensus.
 
         Parameters:
         local_id: str
@@ -28,6 +51,10 @@ class Application:
         disk_path: str
             The path where the components of the cluster system are store,
             primarily the JSON config file and transaction log.
+        config: optional[dict]
+            Send configuration directly if starting the cluster from a JSON
+            config rather than from on-disk configuration. Checkout the
+            ClusterConfig class for example configuation keys.
         """
         if disk_path is not None:
             cluster = Cluster.from_disk(local_id, disk_path)
@@ -126,3 +153,64 @@ class Application:
         # create a LogEntry, call `request_transaction`, and finally return
         # success.
         writer.close()
+
+    async def run(self, address):
+        """
+        Run the application indefinitely. When the local system becomes the Raft
+        leader, the application server will be started via the ::start_server
+        method. Once started, this will continue to monitor the local system
+        Raft role and will stop and re-start the application server as the
+        system changes state.
+        """
+        # Start out with something awaitable
+        server_task = asyncio.get_event_loop().create_future()
+        while True:
+            try:
+                role_changed = asyncio.ensure_future(
+                    self.local_server.role_changed.wait())
+                for first in asyncio.as_completed((
+                    role_changed,
+                    server_task
+                )):
+                    # This construct will help discover exceptions in the _run
+                    # coroutine
+                    await first
+                    break
+            finally:
+                role_changed.cancel()
+
+            if self.local_server.is_leader():
+                log.info("Local system is the leader. Starting the application")
+                if server_task:
+                    server_task.cancel()
+                server_task = asyncio.create_task(self._run(address))
+
+    async def _run(self, address, start_timeout=5):
+        try:
+            with timeout(start_timeout):
+                while True:
+                    try:
+                        server = await self.start_server(address)
+                        # XXX: Is it sensible to assume this interface?
+                        await server.start_serving()
+                        log.info("Application is running")
+                        break
+                    except OSError:
+                        # Sometimes this happens when switching leaders
+                        pass
+                    await asyncio.sleep(0.1)
+        except asyncio.TimeoutError:
+            raise SystemError("Unable to start application server")
+
+        try:
+            if self.local_server.is_leader():
+                await self.local_server.role_changed.wait()
+
+            log.warning("No longer the leader. Shutting down application")
+        finally:
+            server.close()
+            for x in self.clients:
+                if not x.done():
+                    x.cancel()
+            await server.wait_closed()
+            log.info("Server shut down")
