@@ -3,14 +3,51 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 import os, os.path
 import pickle
-import struct
+import shutil
 import time
-from typing import Iterable, Type
+from typing import Iterable
 
 import logging
+
 log = logging.getLogger('raft.storage')
 
-class LogStorageBackend:
+class PersistenceBase:
+    async def startup(self):
+        raise NotImplemented
+
+    def save(self, transactions: Iterable, starting=0, start_index=0,
+        first_index=1):
+        """
+        Commit the transcations to the write-ahead log. And then schedule the
+        write-ahead log to be flushed after some time.
+        """
+        raise NotImplemented
+
+    def load(self, starting: int=0):
+        """
+        Yields "chunks" of the log file. The size of each chunk is configured by
+        the ::chunk_size instance property.
+
+        Parameters:
+        starting: int = 0
+            Start loading at index <starting+1> (instead of starting from the
+            beginning of the log on disk)
+        """
+        raise NotImplemented
+
+    def load_partial(self, count: int, starting: int=0):
+        # Fast-forward the load process to skip to the first chunk with
+        # <starting>
+        for chunk in iter_from_chunks(self.load(starting), count):
+            yield chunk
+
+    def get(self, index):
+        raise NotImplemented
+
+    def purge(self):
+        raise NotImplemented
+
+class LogStorageBackend(PersistenceBase):
     """
     Backend which can load or persist a TransactionLog to and from disk.
 
@@ -35,9 +72,10 @@ class LogStorageBackend:
     pickle.load to read the chunk.
     """
     @dataclass
-    class Footer:
+    class HeaderEntry:
         startIndex: int             # First index in THIS file
         chunkSize: int              # Size of the chunks
+        filename: str = ''          # Name of THIS file
         chunksInFile: int = 0       # Number of chunks in THIS file
         firstIndex: int = 0         # Absolute start of the entire log
         lastIndex: int = 0          # Absolute end of the entire log
@@ -46,26 +84,21 @@ class LogStorageBackend:
 
     filename = "transactions"
 
-    def __init__(self, path, chunk_size=100):
+    def __init__(self, path, chunk_size=200, wal_max_length=100):
         self.path = path
         self.chunk_size = chunk_size
 
         # Write-ahead log init
         self.wal = WriteAheadLog(path, chunk_size)
         self.wal_flush_task = None
+        self.wal_max_len = wal_max_length
 
     async def startup(self):
         await self.wal.load(self)
 
-    @property
-    def _footer_size(self):
-        return struct.calcsize("!I")
-
-    def _read_footer(self, open_file):
-        open_file.seek(-self._footer_size, os.SEEK_END)
-        footer_offset, = struct.unpack("!I", open_file.read(self._footer_size))
-        open_file.seek(footer_offset, os.SEEK_SET)
-        return pickle.load(open_file), footer_offset
+    def _read_dir(self) -> 'LogStorageBackend.HeaderEntry':
+        with open(self.fullpath + ".dir", 'rb') as header_file:
+            return pickle.load(header_file)
 
     def save(self, transactions: Iterable, starting=0, start_index=0,
         first_index=1):
@@ -79,11 +112,10 @@ class LogStorageBackend:
         self.wal.extend(transactions[starting - start_index:], starting)
         self.wal_flush_task = asyncio.create_task(self.delay_flush())
 
-        # TODO: If the WAL log is over N entries, then pause and replay all or
-        # part of it.
-
     async def delay_flush(self, delay=5):
         try:
+            # If the WAL log is over N entries, then don't pause and replay it
+            # immediately.
             await asyncio.sleep(delay)
             await self.wal.replay_and_clear(self)
         except asyncio.CancelledError:
@@ -124,14 +156,12 @@ class LogStorageBackend:
         start = time.monotonic()
         file_name = self.fullpath
         try:
-            with open(file_name, 'rb') as infile:
-                footer, footer_offset = self._read_footer(infile)
+            footer  = self._read_dir()
         except FileNotFoundError:
             # XXX: The transaction log needs the concept of an offset/firstIndex
             # to support truncating for snapshots.
-            footer = self.Footer(startIndex=first_index,
+            footer = self.HeaderEntry(startIndex=first_index,
                 chunkSize=self.chunk_size, offsets=[0])
-            footer_offset = 0
 
         # What chunk do we want to start writing
         chunk_size = footer.chunkSize
@@ -139,21 +169,23 @@ class LogStorageBackend:
         footer.chunksInFile = start_chunk
         footer.firstIndex = first_index
         footer.lastIndex = start_chunk * chunk_size
+        footer.filename = file_name
+
+        # If the write starts in the middle of a chunk, load the current chunk
+        # so the new data can be placed in it.
+        offset = (starting - first_index + 1) % chunk_size
+        last_chunk = []
 
         # Truncate the chunk offsets if replacing a chunk before the end. (The
         # file will be truncated below.)
         if start_chunk < len(footer.offsets):
             start_offset = footer.offsets[start_chunk]
             del footer.offsets[start_chunk:]
+            if offset > 0:
+                last_chunk = next(self.load(starting - offset))
         else:
             # New chunk
-            start_offset = footer_offset
-
-        # If the write starts in the middle of a chunk, load the current chunk
-        # so the new data can be placed in it.
-        offset = (starting - first_index + 1) % chunk_size
-        if offset != 0:
-            last_chunk = next(self.load_partial(chunk_size, starting - offset))
+            start_offset = os.path.getsize(self.fullpath)
 
         # Truncate the file at the offset plus header size
         if os.path.exists(file_name):
@@ -165,7 +197,7 @@ class LogStorageBackend:
         with open(file_name, 'ab') as outfile:
             outfile.seek(start_offset, os.SEEK_SET)
             for i, chunk in enumerate(chunks, start=start_chunk):
-                if start_chunk <= len(footer.offsets):
+                if i >= len(footer.offsets):
                     footer.offsets.append(outfile.tell())
                 else:
                     footer.offsets[i] = outfile.tell()
@@ -179,12 +211,11 @@ class LogStorageBackend:
                     offset = 0
                 pickle.dump(chunk, outfile)
 
-            # Now write the footer
-            footer_offset = outfile.tell()
-            pickle.dump(footer, outfile)
+        # Now write the footer
+        with open(self.fullpath + "._dir", 'wb') as header_file:
+            pickle.dump(footer, header_file)
 
-            # Now write the footer_size
-            outfile.write(struct.pack("!I", footer_offset))
+        shutil.move(self.fullpath + "._dir", self.fullpath + ".dir")
 
         elapsed = time.monotonic() - start
         log.debug(f"Updating log file took {elapsed:.3f}s")
@@ -207,18 +238,15 @@ class LogStorageBackend:
             with open(file_path, "rb") as infile:
                 # Skip to the chunk where `starting` offset can be found
                 if starting > 0:
-                    footer, _ = self._read_footer(infile)
+                    footer = self._read_dir()
                     start_chunk = starting // footer.chunkSize
                     if start_chunk >= len(footer.offsets):
-                        raise ValueError("`starting` value beyond end of log")
+                        raise ValueError(f"`starting` ({starting}) value beyond end of log")
                     starting = starting % footer.chunkSize
                     infile.seek(footer.offsets[start_chunk], os.SEEK_SET)
 
                 while True:
                     chunk = pickle.load(infile)
-                    # The footer represents the end of the file
-                    if type(chunk) is self.Footer:
-                        break
                     if starting:
                         yield chunk[starting:]
                         starting = 0
@@ -226,19 +254,16 @@ class LogStorageBackend:
                         yield chunk
         except FileNotFoundError:
             pass
-
-    def load_partial(self, count: int, starting: int=0):
-        # Fast-forward the load process to skip to the first chunk with
-        # <starting>
-        for chunk in iter_from_chunks(self.load(starting), count):
-            yield chunk
+        except EOFError:
+            # End of input
+            pass
 
     @lru_cache(maxsize=128)
     def get(self, index):
         try:
             for chunk in self.load_partial(1, index):
                 return chunk[0]
-        except IndexError:
+        except (IndexError, ValueError):
             log.info(f"Log doesn't have entry at offset {index}. Searching WAL")
             # TODO: Attempt to fetch from WAL
             return self.wal.try_find(index)
@@ -283,12 +308,13 @@ class WriteAheadLog(list):
         items: tuple[object]    # The entries
 
     filename = "transactions.wal"
-    alt_filename = "transactions.wal2"
+    alt_filename = "transactions._wal"
 
     def __init__(self, path, chunk_size):
         self.path = path
         self.chunk_size = chunk_size
         self.entries = []
+        self.replay_lock = asyncio.Lock()
         super().__init__()
 
     async def load(self, backend: LogStorageBackend):
@@ -299,18 +325,26 @@ class WriteAheadLog(list):
                         self.append(pickle.load(walfile))
                 except EOFError:
                     pass
-            await self.replay(backend)
+            await self.replay_and_clear(backend)
         except FileNotFoundError:
             pass
 
     async def replay(self, backend: LogStorageBackend):
-        for i, (offset, chunk) in enumerate(self.chunkize()):
-            log.info(f"Committing WAL chunk @{offset}+#{len(chunk)}")
-            backend.write(chunk, starting=offset)
-            if i % 10 == 9:
-                await asyncio.sleep(0)
+        async with self.replay_lock:
+            log.info(f"Committing WAL log ({len(self)} chunks)")
+            for i, (offset, chunk) in enumerate(self.chunkize()):
+                backend.write(chunk, starting=offset)
+                if i % 10 == 9:
+                    await asyncio.sleep(0)
 
     async def replay_and_clear(self, backend: LogStorageBackend):
+        """
+        Replay the log up to the current position and then clear up to that
+        position. This allows for the WAL to be appended to while it is also
+        being applied/replayed.
+        """
+        # XXX: There's a race here where starting replay_and_clear concurrently
+        # would probably arrive at corruption.
         size = len(self)
         await self.replay(backend)
         self.clear(up_through=size)
@@ -353,7 +387,7 @@ class WriteAheadLog(list):
         items in the chunk come immediately after one another in the log.
         """
         if len(self) == 0:
-            yield []
+            yield 0, []
             return
 
         firstIndex = startIndex = self[0].startIndex

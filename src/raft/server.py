@@ -67,9 +67,9 @@ class LocalServer:
         for server in self.cluster.remote_servers:
             await server.start(self)
 
+        # Open a socket and handle messages
         await self.ensure_dgram_endpoint()
 
-        # Open a socket and handle messages
         self.comm_tasks = [
             asyncio.create_task(self.receive_messages()),
             asyncio.create_task(self.send_messages()),

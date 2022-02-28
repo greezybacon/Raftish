@@ -159,12 +159,12 @@ class LeaderRole(Role):
         ) as server_tasks:
             while True:
                 # Also wait for exceptions from any of the sync tasks
-                for task in asyncio.as_completed((
+                for first in asyncio.as_completed((
                     self.sync_event.wait(),
                     *server_tasks
                 )):
                     # Look for first completed or exception
-                    await task
+                    await first
                     break
 
                 self.sync_event.clear()
@@ -261,10 +261,12 @@ class LeaderRole(Role):
 
             server.state.matchIndex = response.matchIndex
             server.state.nextIndex = nextIndex
-            self.sync_event.set()
+
+            # Don't signal sync event if no new entries were sent
+            if len(entries):
+                self.sync_event.set()
 
             # TODO: Impose a minimum wait time between packets
-            await asyncio.sleep(0.005)
 
             # If the server is not yet caught up, then keep sending more packets
             if local.log.lastIndex >= nextIndex:
