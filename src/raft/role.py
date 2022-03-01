@@ -205,7 +205,7 @@ class LeaderRole(Role):
             # Fetch a list of entries AFTER (not including) the previous
             # entry
             entries = local.log.since(prevIndex, max_entries=entryCount)
-            assert len(entries) >= 0
+            assert entries is not None
 
             # Determine the TERM of the entry in the prevIndex slot
             if prevIndex == 0:

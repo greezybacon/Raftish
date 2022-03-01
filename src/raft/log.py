@@ -181,6 +181,8 @@ class LogBase(list):
                         for cb in self.apply_callbacks
                     ))):
                     return False
+            except asyncio.CancelledError:
+                raise
             except:
                 log.exception("Error applying log transactions")
 

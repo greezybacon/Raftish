@@ -184,6 +184,9 @@ class Application:
                 if server_task:
                     server_task.cancel()
                 server_task = asyncio.create_task(self._run(address))
+            if server_task.done():
+                server_task = asyncio.get_event_loop().create_future()
+
 
     async def _run(self, address, start_timeout=5):
         try:
