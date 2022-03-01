@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass, field
+from contextlib import contextmanager
 from functools import lru_cache
 import os, os.path
 import pickle
@@ -84,16 +85,20 @@ class LogStorageBackend(PersistenceBase):
 
     filename = "transactions"
 
-    def __init__(self, path, chunk_size=200, wal_max_length=100):
+    def __init__(self, path, chunk_size=200):
         self.path = path
         self.chunk_size = chunk_size
 
         # Write-ahead log init
         self.wal = WriteAheadLog(path, chunk_size)
         self.wal_flush_task = None
-        self.wal_max_len = wal_max_length
+
+    def __del__(self):
+        if hasattr(self, 'wal_replay'):
+            self.wal_replay.cancel()
 
     async def startup(self):
+        self.wal_replay = asyncio.create_task(self.wal.auto_replay(self))
         await self.wal.load(self)
 
     def _read_dir(self) -> 'LogStorageBackend.HeaderEntry':
@@ -102,26 +107,9 @@ class LogStorageBackend(PersistenceBase):
 
     def save(self, transactions: Iterable, starting=0, start_index=0,
         first_index=1):
-        """
-        Commit the transcations to the write-ahead log. And then schedule the
-        write-ahead log to be flushed after some time.
-        """
-        if self.wal_flush_task is not None:
-            self.wal_flush_task.cancel()
-
+        # Write out to the WAL. It will lazily replay it back to the log here.
+        # (Via the ::write method)
         self.wal.extend(transactions[starting - start_index:], starting)
-        self.wal_flush_task = asyncio.create_task(self.delay_flush())
-
-    async def delay_flush(self, delay=5):
-        try:
-            # If the WAL log is over N entries, then don't pause and replay it
-            # immediately.
-            await asyncio.sleep(delay)
-            await self.wal.replay_and_clear(self)
-        except asyncio.CancelledError:
-            pass
-        except:
-            log.exception("Error in WAL replay")
 
     @property
     def fullpath(self):
@@ -229,6 +217,8 @@ class LogStorageBackend(PersistenceBase):
         starting: int = 0
             Start loading at index <starting+1> (instead of starting from the
             beginning of the log on disk)
+
+        Returns: Iterator[List[LogEntry]]
         """
         if starting < 0:
             raise ValueError('`starting` value cannot be negative')
@@ -255,7 +245,7 @@ class LogStorageBackend(PersistenceBase):
         except FileNotFoundError:
             pass
         except EOFError:
-            # End of input
+            # End of input (ie. no more chunks)
             pass
 
     @lru_cache(maxsize=128)
@@ -296,7 +286,70 @@ def iter_from_chunks(chunks, count=None):
         else:
             yield chunk
 
-# Impelement a sort-of write-ahead-log where the entries are written out
+
+class LazilyClosed:
+    """
+    Simple interface to allow for delayed / lazy closing of a file opened for
+    writing.
+
+    Usage:
+    >>> myfile = LazilyClosed(path)
+    >>> with myfile.open('ab') as outfile:
+    ...    outfile.write(...)
+
+    Then, the file won't be closed for some time after the block. If the block
+    runs again or the ::open() method is called again before the close timeout,
+    then the open handle is reused without re-opening the file.
+    """
+    def __init__(self, path, close_delay=0.5):
+        """
+        Parameters:
+        path: str
+            Full path of file to be opened. Will be passed directly to the
+            open() function.
+        close_delay: float = 0.5
+            Amount of time after the ::open() block has completed when the file
+            will be closed.
+        """
+        self.path = path
+        self.open_file = None
+        self.close_delay = None
+        self.close_delay_time = close_delay
+
+    @contextmanager
+    def open(self, mode):
+        if self.close_delay is not None:
+            self.close_delay.cancel()
+
+        if self.open_file is not None:
+            _, open_mode = self.open_file
+            if open_mode != mode:
+                self.close()
+
+        if self.open_file is None:
+            self.open_file = (open(self.path, mode), mode)
+
+        yield self.open_file[0]
+
+        self.close_delay = asyncio.create_task(self.close_wait())
+
+    async def close_wait(self):
+        await asyncio.sleep(self.close_delay_time)
+        self.close_delay = None
+        self.close()
+
+    def close(self):
+        if self.close_delay is not None:
+            self.close_delay.cancel()
+
+        if self.open_file is not None:
+            log.info(f"Closing file {self.path} lazily")
+            handle, _ = self.open_file
+            self.open_file = None
+            handle.close()
+
+
+# Implement a sort-of write-ahead-log where the entries are written out
 # incrementally to a separate file. Then, when the file reaches a certain number
 # of items, or after some timeout, the items are added as a "chunk" to the
 # storage log.
@@ -315,6 +368,8 @@ class WriteAheadLog(list):
         self.chunk_size = chunk_size
         self.entries = []
         self.replay_lock = asyncio.Lock()
+        self.extend_event = asyncio.Event()
+        self.lazyclose = LazilyClosed(os.path.join(self.path, self.filename))
         super().__init__()
 
     async def load(self, backend: LogStorageBackend):
@@ -350,23 +405,54 @@ class WriteAheadLog(list):
         self.clear(up_through=size)
 
     def open(self, mode='ab'):
-        return open(os.path.join(self.path, self.filename), mode)
+        return self.lazyclose.open(mode)
 
     def open_alt(self, mode='wb'):
         return open(os.path.join(self.path, self.alt_filename), mode)
 
     def commit_alt(self):
+        self.lazyclose.close()
         shutil.move(os.path.join(self.path, self.alt_filename),
             os.path.join(self.path, self.filename))
 
     def extend(self, items, start_offset):
+        # Write the data out to disk
         with self.open() as walfile:
             entry = self.Entry(
                 startIndex=start_offset,
                 items=tuple(items)
             )
             pickle.dump(entry, walfile)
+            walfile.flush()
+            os.fsync(walfile)
+
+        # Add to in-memory version
         self.append(entry)
+        self.extend_event.set()
+
+    async def auto_replay(self, backend: PersistenceBase,
+        delay: float=5.0, max_length=1000):
+        """
+        Task to automatically replay and clear the WAL as entries are appended
+        (via ::extend) to the log. Once the length reaches `max_length` or the
+        time since the last ::extend() call exceeds `delay`, the WAL will be
+        automatically committed / replayed to the storage backend.
+        """
+        while True:
+            try:
+                timeout = delay if len(self) < max_length else 0
+                await asyncio.wait_for(
+                    self.extend_event.wait(),
+                    timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                try:
+                    if len(self):
+                        await self.replay_and_clear(backend)
+                except:
+                    log.exception("Unexpected error flushing WAL log")
+
+            self.extend_event.clear()
 
     def clear(self, up_through=None):
         if up_through is not None:
