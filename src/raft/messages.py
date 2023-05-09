@@ -4,7 +4,6 @@ from dataclasses import dataclass
 import pickle
 import struct
 import time
-from typing import Type
 
 from .exception import NewTermError, TheresAnotherLeader
 from .log import LogEntry
@@ -29,15 +28,16 @@ class Message:
     @classmethod
     def from_bytes(self, bytes):
         view = memoryview(bytes)
-        header = struct.calcsize("!II")
-        size, id = struct.unpack("!II", view[:header])
-        message = pickle.loads(view[header:header+size])
+        id, message = pickle.loads(view)
         message.id = id
         return message
 
-    def ensure_id(self):
+    def ensure_id(self, extra: int=None):
         if not hasattr(self, 'id'):
-            self.id = next(id_sequence)
+            id = next(id_sequence)
+            if extra is not None:
+                id = (extra, id)
+            self.id = id
 
     async def send(self, socket, destination):
         self.ensure_id()
@@ -47,14 +47,11 @@ class Message:
         await response._send(self.id, socket, destination)
 
     async def _send(self, id, socket, destination):
-        message = pickle.dumps(self)
-        assert len(message) < 1300
-        await socket.send(
-            struct.pack("!II", len(message), id) + message,
-            destination)
+        message = pickle.dumps((id, self), 3)
+        await socket.send(message, destination)
 
     async def handle(self, server, sender):
-        raise NotImplemented
+        raise NotImplementedError
 
 class Response(Message):
     def set_id(self, message: Message):
@@ -86,7 +83,7 @@ class RequestVote(Message):
             voteGranted=should_vote
         )
 
-    def should_vote_for_candidate(self, server):
+    def should_vote_for_candidate(self, server: 'LocalServer'):
         # Respond NO if sender term is less than local
         if self.term < server.currentTerm:
             return False
@@ -97,7 +94,14 @@ class RequestVote(Message):
                 and self.lastLogTerm < server.log.lastEntry.term:
             return False
         # Server can only vote once per term
-        elif server.config.hasVoted:
+        elif self.term == server.currentTerm and server.config.hasVoted:
+            return False
+        # Server should not vote if it is a leader?
+        elif server.is_leader():
+            return False
+        # Remote server must be in local systems
+        elif self.candidateId not in server.cluster.remote_server_ids:
+            log.warn("Got vote request from foreign server")
             return False
 
         # else respond YES
@@ -119,6 +123,9 @@ class AppendEntries(Message):
         matchIndex: int = 0
 
     async def handle(self, server, sender) -> Response:
+        if self.leaderId not in server.cluster.remote_server_ids:
+            return
+
         if self.term > server.currentTerm:
             raise NewTermError(self.term)
 
@@ -194,7 +201,11 @@ class WaitList(dict):
         """
         log.debug(f"Starting wait for message {message.id}")
         item = self[message.id] = self.Item.for_message(message, timeout or self.max_lifetime)
-        return await asyncio.wait_for(item.waiter, timeout=timeout)
+        try:
+            return await item.waiter
+        finally:
+            if message.id in self:
+                del self[message.id]
 
     def set_response(self, response):
         log.debug(f"Resolving wait for message {response.id}")
@@ -202,7 +213,10 @@ class WaitList(dict):
         id = response.id
         try:
             if id in self:
+                assert isinstance(response, Response)
                 self[id].waiter.set_result(response)
+            else:
+                log.warning(f"No waiter for response id {id}")
         except asyncio.InvalidStateError:
             # The waiter was probably cancelled
             pass
@@ -215,5 +229,5 @@ class WaitList(dict):
         for id in to_remove:
             # Notify the waiter that a response isn't coming
             if not self[id].waiter.done():
-                self[id].waiter.set_exception(asyncio.TimeoutError())
+                self[id].waiter.set_exception(asyncio.TimeoutError)
             del self[id]

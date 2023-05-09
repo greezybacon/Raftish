@@ -78,7 +78,7 @@ async def step_impl(context, content):
     assert local_server.is_leader(), \
         f"Server has role {local_server.role}"
 
-    local_server.append_entry(LogEntry(
+    await local_server.append_entry(LogEntry(
         term=local_server.currentTerm,
         value=content
     ))

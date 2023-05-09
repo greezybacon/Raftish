@@ -1,11 +1,9 @@
 import asyncio
 import random
 import time
-from typing import Type
 
-from .exception import NewTermError
-from .messages import Message, AppendEntries, RequestVote
-from .util import cancelling
+from .exception import NewTermError, TheresAnotherLeader
+from .util import BroadcastEvent
 
 import logging
 log = logging.getLogger('raft.role')
@@ -21,9 +19,9 @@ class Role:
         Returns: Role
         Returns the new role to which the server should transistion.
         """
-        raise NotImplemented
+        raise NotImplementedError
 
-    async def handle_message(self, message: Message, sender):
+    async def handle_message(self, message: 'Message', sender):
         return await message.handle(self.local_server, sender)
 
 class FollowerRole(Role):
@@ -31,7 +29,7 @@ class FollowerRole(Role):
         super().__init__(server)
         # Election timeout is between half and full election_timeout
         self.timeout_time = server.cluster.config.election_timeout
-        self.message_event = asyncio.Event()
+        self.got_message = asyncio.Event()
 
     async def initiate(self):
         # Await APPEND_ENTRIES message from the leader, request change to
@@ -39,16 +37,16 @@ class FollowerRole(Role):
         try:
             while True:
                 await asyncio.wait_for(
-                    self.message_event.wait(),
+                    self.got_message.wait(),
                     timeout=self.timeout_time)
-                self.message_event.clear()
+                self.got_message.clear()
         except asyncio.TimeoutError:
             # Suggest the server should transistion to the CandidateRole
             return CandidateRole
 
-    async def handle_message(self, message: Message, sender):
-        if type(message) in (AppendEntries, RequestVote):
-            self.message_event.set()
+    async def handle_message(self, message: 'Message', sender):
+        if type(message) in (AppendEntries,):
+            self.got_message.set()
 
         return await super().handle_message(message, sender)
 
@@ -68,6 +66,8 @@ class CandidateRole(Role):
             start = time.monotonic()
             votes = await self.hold_election(wait_time, votes_needed)
 
+            log.info(f"{self.local_server.id}: Election's over. Got {votes} votes, need {votes_needed}")
+
             if votes >= votes_needed:
                 return LeaderRole
 
@@ -76,18 +76,25 @@ class CandidateRole(Role):
             elapsed = time.monotonic() - start
             await asyncio.sleep(max(0, wait_time - elapsed))
 
+    async def handle_message(self, message: 'Message', sender):
+        if type(message) is AppendEntries:
+            if message.leaderId in self.local_server.cluster.remote_server_ids:
+                raise TheresAnotherLeader()
+
+        return await super().handle_message(message, sender)
+
     async def hold_election(self, wait_time, votes_needed):
-        log.info(f"Holding a new election, wait_time := {wait_time:.3f}")
+        log.info(f"{self.local_server.id}: Holding a new election, term := {self.local_server.currentTerm}, wait_time := {wait_time:.3f}")
         # Vote for self
         self.local_server.voteFor(term=self.local_server.currentTerm,
             candidate=self.local_server.id)
         votes = 1
 
-        constituants = [
-            asyncio.ensure_future(self.request_vote(server))
-            for server in self.local_server.cluster.remote_servers
-        ]
         try:
+            constituants = [
+                self.request_vote(server)
+                for server in self.local_server.cluster.remote_servers
+            ]
             for request in asyncio.as_completed(constituants, timeout=wait_time):
                 response = await request
 
@@ -105,10 +112,6 @@ class CandidateRole(Role):
             # Continue with the votes we collected (probably not enough
             # though..). But cancel the remaining vote requests first
             pass
-        finally:
-            for x in constituants:
-                if not x.done():
-                    x.cancel()
 
         # Return the results of the vote
         return votes
@@ -153,29 +156,32 @@ class LeaderRole(Role):
         # commitIndex when the cluster reaches concensus on the appending of the
         # LogEntries.
 
-        with cancelling(
-            asyncio.create_task(self.sync_server(server))
+        server_sync_tasks = [
+            self.sync_server(server)
             for server in local.cluster.remote_servers
-        ) as server_tasks:
-            while True:
-                # Also wait for exceptions from any of the sync tasks
-                for first in asyncio.as_completed((
+        ]
+
+        while True:
+            # Also wait for exceptions from any of the sync tasks
+            try:
+                await asyncio.wait((
                     self.sync_event.wait(),
-                    *server_tasks
-                )):
-                    # Look for first completed or exception
-                    await first
-                    break
-
+                    *server_sync_tasks
+                ), return_when=asyncio.FIRST_COMPLETED)
                 self.sync_event.clear()
+            except asyncio.CancelledError:
+                break
+            except:
+                log.exception("Received unexpected error in leader sync; restarting")
+                return LeaderRole
 
-                # Advance the commitIndex; however, only items in the
-                # current leader's term can be used to advance the commit
-                # index. Once advanced. Then all previous entries are also
-                # committed.
-                if len(local.log):
-                    if local.currentTerm == local.log.lastEntry.term:
-                        await local.advanceCommitIndex(local.cluster.lastCommitIndex())
+            # Advance the commitIndex; however, only items in the
+            # current leader's term can be used to advance the commit
+            # index. Once advanced. Then all previous entries are also
+            # committed.
+            if len(local.log):
+                if local.currentTerm == local.log.lastEntry.term:
+                    await local.advanceCommitIndex(local.cluster.lastCommitIndex())
 
     async def sync_server(self, server: 'RemoteServer'):
         """
@@ -193,7 +199,7 @@ class LeaderRole(Role):
         local = self.local_server
         nextIndex = local.log.lastIndex + 1
         heartbeat_time = min_heartbeat_time = self.heartbeat_time
-        max_heartbeat_time = heartbeat_time * 5
+        max_heartbeat_time = heartbeat_time * 2
         entryCount = 5
         while True:
             # Okay- so the local log extends from 1 to lastIndex, unless
@@ -242,7 +248,9 @@ class LeaderRole(Role):
                     log.warning(f"Trouble communicating with server {server.id}")
                 continue
 
-            assert type(response) is AppendEntries.Response
+            if type(response) is not AppendEntries.Response:
+                log.error(f"Got unexpected message type {type(response)}: {response}")
+                continue
 
             # Handle returning from lost messages
             if server.state.lostMessages > 10:
@@ -285,3 +293,4 @@ class LeaderRole(Role):
 
 # Circular dependency imports
 from .server import LocalServer, RemoteServer
+from .messages import AppendEntries, RequestVote

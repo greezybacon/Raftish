@@ -11,6 +11,7 @@ from .exception import (
 )
 from .log import TransactionLog
 from .messages import Message, Response, WaitList
+from .util import BroadcastEvent
 
 import logging
 log = logging.getLogger('raft.server')
@@ -42,8 +43,9 @@ class LocalServer:
 
         # Coordination
         self.role = None
-        self.append_event = asyncio.Event()
-        self.role_changed = asyncio.Event()
+        self.append_event = BroadcastEvent()
+        self.role_changed = asyncio.Condition()
+        self.role_change_request = asyncio.Queue(maxsize=1)
 
     @property
     def id(self):
@@ -61,6 +63,7 @@ class LocalServer:
         await self.log.load()
 
         # Start as a follower
+        self.role_task = asyncio.create_task(self.do_role())
         await self.become_follower()
 
         # Get ready to communicate with remote servers
@@ -92,29 +95,42 @@ class LocalServer:
         
     async def switch_role(self, new_role):
         if type(self.role) is new_role:
+            log.warn(f"{self.id}: Attempting to switch to {new_role} again")
             return
 
-        if hasattr(self, 'role_task'):
-            self.role_task.cancel()
-
-        self.role_task = asyncio.create_task(self.do_role(new_role))
+        await self.role_change_request.put(new_role)
         while type(self.role) is not new_role:
             await asyncio.sleep(0)
 
-    async def do_role(self, next_role: "Role"):
+    async def do_role(self):
+        next_role = await self.role_change_request.get()
         while True:
             try:
-                log.info(f"{self.id}: Switching to {next_role} role")
-                self.role = next_role(self)
-                self.role_changed.set()
-                self.role_changed.clear()
-                next_role = await self.role.initiate()
+                async with self.role_changed:
+                    self.role_changed.notify_all()
+
+                try:
+                    self.role = next_role(self)
+                    self.role_task = asyncio.ensure_future(self.role.initiate())
+                    done, not_done = await asyncio.wait((
+                        self.role_task,
+                        self.role_change_request.get()
+                    ), return_when=asyncio.FIRST_COMPLETED)
+
+                    for t in not_done:
+                        t.cancel()
+                    next_role = await done.pop()
+                except asyncio.CancelledError:
+                    break
+
                 if next_role is None:
+                    log.error("Role task returned `None`")
                     raise DeadlockError("Role task returned but did not specify next role")
             except TheresAnotherLeader:
                 next_role = FollowerRole
             except NewTermError as e:
                 next_role = FollowerRole
+                assert e.term > self.config.currentTerm
                 self.config.currentTerm = e.term
             except asyncio.CancelledError:
                 break
@@ -170,8 +186,7 @@ class LocalServer:
             raise LocalAppendFailed
 
         # Tickle the append_event for anyone listening
-        self.append_event.set()
-        self.append_event.clear()
+        self.append_event.notify_all()
 
         return lastId
 
@@ -301,7 +316,7 @@ class RemoteServer:
         self.wait_list = server.wait_list
 
     async def transceive(self, message, timeout=None):
-        message.ensure_id()
+        message.ensure_id(extra=self.id)
         await self.out_queue.put((message, self.address))
         return await self.wait_list.wait_for(message, timeout=timeout)
 

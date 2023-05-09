@@ -56,21 +56,27 @@ class LogStorageBackend(PersistenceBase):
     The on-disk format for the transaction log is a number of pickle objects
     followed by a single 4-byte integer:
 
-        pickle<list[LogEntry]>
-        pickle<list[LogEntry]>
-        ...
-        pickle<LogStorageBackend.Footer>
-        sizeof<Footer>
+        Log: (transactions.log)
+            pickle<list[LogEntry]>
+            pickle<list[LogEntry]>
+            ...
 
-    Seeking the file is simplest by reading the 4-byte footer-size at the end of
-    the file. Then seek to the end of the file minus that size, minus the
-    4-bytes. Then read the Footer.
+    Directory: pickle<LogStorageBackend.HeaderEntry>
+    Placing the chunk directory in with the transaction chunks is problematic.
+    Because the length of the directory is not fixed, so it can't go at the
+    beginning of the transaction log. And, if the log file is truncated and new
+    chunks are added and the directory is written to the end of the file, if the
+    process is interrupted, then the transaction log will not have a directory
+    any more.
 
-    The Footer object includes a list of location offsets of each of the chunks.
-    To read all the chunks, start reading with pickle.load() from the beginning
-    of the file. To read a specific chunk, use the offset list in the footer to
-    find the location of the desired chunk. Then seek to that location and use
-    pickle.load to read the chunk.
+    This gets much simpler by placing the directory in a different file. And,
+    when the directory is changed, it's done so atomicly.
+
+    The HeaderEntry object includes a list of location offsets of each of the
+    chunks.  To read all the chunks, start reading with pickle.load() from the
+    beginning of the file. To read a specific chunk, use the offset list in the
+    directory to find the location of the desired chunk. Then seek to that
+    location and use pickle.load to read the chunk.
     """
     @dataclass
     class HeaderEntry:
@@ -92,6 +98,9 @@ class LogStorageBackend(PersistenceBase):
         # Write-ahead log init
         self.wal = WriteAheadLog(path, chunk_size)
         self.wal_flush_task = None
+
+        if not os.path.exists(self.path):
+            raise Exception()
 
     def __del__(self):
         if hasattr(self, 'wal_replay'):
@@ -136,11 +145,7 @@ class LogStorageBackend(PersistenceBase):
             was compacted and the stored log starts from some point after index
             1, this would be that index.
         """
-        # TODO: Consider making the operation atomic by copying the part of the
-        # file to be kept to a new file and adding the new stuff to the end and
-        # then moving it into place.
-
-        # Load the footer from the existing file
+        # Load the header to get the chunk offsets in the existing log
         start = time.monotonic()
         file_name = self.fullpath
         try:
@@ -149,7 +154,8 @@ class LogStorageBackend(PersistenceBase):
             # XXX: The transaction log needs the concept of an offset/firstIndex
             # to support truncating for snapshots.
             footer = self.HeaderEntry(startIndex=first_index,
-                chunkSize=self.chunk_size, offsets=[0])
+                chunkSize=self.chunk_size, offsets=[0],
+                filename=file_name.replace(self.path.rstrip('/'), '.'))
 
         # What chunk do we want to start writing
         chunk_size = footer.chunkSize
@@ -157,7 +163,6 @@ class LogStorageBackend(PersistenceBase):
         footer.chunksInFile = start_chunk
         footer.firstIndex = first_index
         footer.lastIndex = start_chunk * chunk_size
-        footer.filename = file_name
 
         # If the write starts in the middle of a chunk, load the current chunk
         # so the new data can be placed in it.
@@ -175,14 +180,14 @@ class LogStorageBackend(PersistenceBase):
             # New chunk
             start_offset = os.path.getsize(self.fullpath)
 
-        # Truncate the file at the offset plus header size
-        if os.path.exists(file_name):
-            os.truncate(file_name, start_offset)
-
         # Write the chunks starting as requested
         chunks = chunkize(transactions, chunk_size, chunk_size - offset)
 
-        with open(file_name, 'ab') as outfile:
+        with open(self.fullpath, 'ab') as outfile:
+            # Truncate the file at the offset of the last chunk
+            if start_offset > 0:
+                os.truncate(outfile.fileno(), start_offset)
+
             outfile.seek(start_offset, os.SEEK_SET)
             for i, chunk in enumerate(chunks, start=start_chunk):
                 if i >= len(footer.offsets):
@@ -198,6 +203,9 @@ class LogStorageBackend(PersistenceBase):
                     chunk = last_chunk
                     offset = 0
                 pickle.dump(chunk, outfile)
+
+            outfile.flush()
+            os.fsync(outfile)
 
         # Now write the footer
         with open(self.fullpath + "._dir", 'wb') as header_file:
@@ -259,9 +267,12 @@ class LogStorageBackend(PersistenceBase):
             return self.wal.try_find(index)
 
     def purge(self):
-        file_path = os.path.join(self.path, self.filename)
+        file_path = self.fullpath
         if os.path.exists(file_path):
             os.unlink(file_path)
+        if os.path.exists(file_path + '.dir'):
+            os.unlink(file_path + '.dir')
+        self.wal.clear()
 
 def chunkize(iterable, chunk_size, first_chunk_size=None):
     l = len(iterable)
@@ -331,10 +342,10 @@ class LazilyClosed:
 
         yield self.open_file[0]
 
-        self.close_delay = asyncio.create_task(self.close_wait())
+        self.close_delay = asyncio.get_event_loop().call_later(
+            self.close_delay_time, self.close_wait)
 
-    async def close_wait(self):
-        await asyncio.sleep(self.close_delay_time)
+    def close_wait(self):
         self.close_delay = None
         self.close()
 
@@ -343,7 +354,6 @@ class LazilyClosed:
             self.close_delay.cancel()
 
         if self.open_file is not None:
-            log.info(f"Closing file {self.path} lazily")
             handle, _ = self.open_file
             self.open_file = None
             handle.close()
@@ -387,10 +397,8 @@ class WriteAheadLog(list):
     async def replay(self, backend: LogStorageBackend):
         async with self.replay_lock:
             log.info(f"Committing WAL log ({len(self)} chunks)")
-            for i, (offset, chunk) in enumerate(self.chunkize()):
-                backend.write(chunk, starting=offset)
-                if i % 10 == 9:
-                    await asyncio.sleep(0)
+            for offset, chunk in self.chunkize():
+                await asyncio.to_thread(backend.write, chunk, starting=offset)
 
     async def replay_and_clear(self, backend: LogStorageBackend):
         """
@@ -400,9 +408,10 @@ class WriteAheadLog(list):
         """
         # XXX: There's a race here where starting replay_and_clear concurrently
         # would probably arrive at corruption.
-        size = len(self)
-        await self.replay(backend)
-        self.clear(up_through=size)
+        if len(self):
+            size = len(self)
+            await self.replay(backend)
+            self.clear(up_through=size)
 
     def open(self, mode='ab'):
         return self.lazyclose.open(mode)
@@ -417,7 +426,7 @@ class WriteAheadLog(list):
 
     def extend(self, items, start_offset):
         # Write the data out to disk
-        with self.open() as walfile:
+        with self.open_alt() as walfile:
             entry = self.Entry(
                 startIndex=start_offset,
                 items=tuple(items)
@@ -428,6 +437,7 @@ class WriteAheadLog(list):
 
         # Add to in-memory version
         self.append(entry)
+        self.commit_alt()
         self.extend_event.set()
 
     async def auto_replay(self, backend: PersistenceBase,
@@ -440,19 +450,19 @@ class WriteAheadLog(list):
         """
         while True:
             try:
-                timeout = delay if len(self) < max_length else 0
-                await asyncio.wait_for(
-                    self.extend_event.wait(),
-                    timeout=timeout
-                )
-            except asyncio.TimeoutError:
                 try:
+                    if len(self) >= max_length:
+                        await self.replay_and_clear(backend)
+                    await asyncio.wait_for(self.extend_event.wait(),
+                        timeout=delay)
+                    self.extend_event.clear()
+                except asyncio.TimeoutError:
                     if len(self):
                         await self.replay_and_clear(backend)
-                except:
-                    log.exception("Unexpected error flushing WAL log")
-
-            self.extend_event.clear()
+            except asyncio.CancelledError:
+                break
+            except:
+                log.exception("Unexpected error flushing WAL log")
 
     def clear(self, up_through=None):
         if up_through is not None:

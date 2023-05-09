@@ -3,7 +3,9 @@ from dataclasses import dataclass
 from itertools import count
 import os, os.path
 
+from .exception import ApplyFailed
 from .storage import LogStorageBackend
+from .util import BroadcastEvent
 
 import logging
 log = logging.getLogger('raft.log')
@@ -28,8 +30,9 @@ class LogBase(list):
     def __init__(self):
         self.lastApplied = 0
         self.start_index = 1
-        self.apply_callbacks = set()
-        self.apply_event = asyncio.Event()
+        self.apply_callbacks = dict()
+        self.apply_waiters = dict()
+        self.apply_event = BroadcastEvent()
         self.application_lock = asyncio.Lock()
 
     def append(self, entry):

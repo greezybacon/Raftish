@@ -34,7 +34,7 @@ def step_impl(context, n):
 async def step_impl(context):
     for _ in range(40):
         await asyncio.wait([
-            server.role_changed.wait()
+            wait_condition(server.role_changed)
             for server in context.servers
         ], return_when=asyncio.FIRST_COMPLETED, timeout=0.05)
 
@@ -44,12 +44,16 @@ async def step_impl(context):
 
     assert False, "Cluster did not elect a leader"
 
+async def wait_condition(c):
+    async with c:
+        return await c.wait()
+
 @then('the cluster will have {n} followers')
 @async_step
 async def step_impl(context, n):
     for _ in range(40):
         await asyncio.wait([
-            server.role_changed.wait()
+            wait_condition(server.role_changed)
             for server in context.servers
         ], return_when=asyncio.FIRST_COMPLETED, timeout=0.05)
 

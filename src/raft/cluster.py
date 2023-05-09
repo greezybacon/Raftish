@@ -39,6 +39,10 @@ class Cluster:
     def remote_servers(self):
         return self._remote_servers
 
+    @property
+    def remote_server_ids(self):
+        return [x.id for x in self._remote_servers]
+
     def lastCommitIndex(self):
         matchIndexes = [x.state.matchIndex for x in self.remote_servers]
         matchIndexes.append(self._local_server.log.lastIndex)
