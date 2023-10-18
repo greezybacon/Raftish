@@ -162,7 +162,7 @@ class WaitList(dict):
     local servers receive queue and allows the sender to be freed from blocking
     directly.
     """
-    max_lifetime = 10
+    max_lifetime = 5
 
     @dataclass
     class Item:

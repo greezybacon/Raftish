@@ -132,7 +132,7 @@ class CandidateRole(Role):
         ))
 
 class LeaderRole(Role):
-    def __init__(self, server, max_entry_count=20):
+    def __init__(self, server, max_entry_count=25):
         """
         Parameters:
         server: LocalServer
@@ -245,7 +245,7 @@ class LeaderRole(Role):
                 heartbeat_time = min(heartbeat_time * 1.05, max_heartbeat_time)
                 server.state.lostMessages += 1
                 if server.state.lostMessages == 10:
-                    log.warning(f"Trouble communicating with server {server.id}")
+                    log.warning(f"{self.local_server.id}: Trouble communicating with server {server.id}")
                 continue
 
             if type(response) is not AppendEntries.Response:

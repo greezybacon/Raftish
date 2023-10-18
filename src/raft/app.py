@@ -1,11 +1,12 @@
 import asyncio
+from http import server
 from typing import Optional
 
 from .cluster import Cluster
 from .config import ClusterConfig
 from .exception import NotALeader
-from .log import LogEntry
-from .util import _timeout as timeout
+from .log import LogEntry, Commitable
+from .util import timeout
 
 import logging
 log = logging.getLogger('raft.app')
@@ -62,9 +63,9 @@ class Application:
             cluster_conf = ClusterConfig.from_json(local_id, config)
             cluster = Cluster(cluster_conf)
 
+        self.clients = []
         self.cluster = cluster
         self.local_server = cluster.local_server
-        self.local_server.log.add_apply_callback(self.commit)
         await self.local_server.start()
 
     @property
@@ -83,7 +84,7 @@ class Application:
         """
         return True
 
-    async def submit(self, content):
+    async def submit(self, content: Commitable):
         """
         Handles a request from a client to perform a transaction. This should be
         performed as an async task, because it might take a while.
@@ -120,13 +121,10 @@ class Application:
             raise NotALeader
 
         entry = LogEntry(term=self.local_server.currentTerm, value=content)
-        indexId = self.local_server.append_entry(entry)
+        indexId = await self.local_server.append_entry(entry)
 
         # Await entry to become "committed"
-        while self.local_server.log.lastApplied < indexId:
-            await self.local_server.log.apply_event.wait()
-
-        return True
+        return await self.local_server.log.await_apply(indexId)
         
     def is_local_leader(self):
         return self.local_server.is_leader()
@@ -144,9 +142,16 @@ class Application:
         handler: async callable(reader, writer)
             Connection handler for incoming connection requests.
         """
-        server = await asyncio.start_server(handler or self.handle_connection,
+        server = await asyncio.start_server(handler or self._handle_connection,
             *address)
         return server
+
+    async def _handle_connection(self, reader, writer):
+        # Should be derived by a subclass to handle messages from the reader,
+        # create a LogEntry, call `request_transaction`, and finally return
+        # success.
+        self.clients.append(asyncio.current_task())
+        return await self.handle_connection(reader, writer)
 
     async def handle_connection(self, reader, writer):
         # Should be derived by a subclass to handle messages from the reader,
@@ -162,35 +167,28 @@ class Application:
         Raft role and will stop and re-start the application server as the
         system changes state.
         """
-        # Start out with something awaitable
-        server_task = asyncio.get_event_loop().create_future()
+        server_task = False
         while True:
-            try:
-                role_changed = asyncio.ensure_future(
-                    self.local_server.role_changed.wait())
-                for first in asyncio.as_completed((
-                    role_changed,
-                    server_task
-                )):
-                    # This construct will help discover exceptions in the _run
-                    # coroutine
-                    await first
+            async with self.local_server.role_changed:
+                await self.local_server.role_changed.wait()
+
+            if server_task and server_task.done():
+                try:
+                    await server_task
+                except asyncio.CancelledError:
                     break
-            finally:
-                role_changed.cancel()
+                except:
+                    log.exception("Critical error in app server task")
 
             if self.local_server.is_leader():
                 log.info("Local system is the leader. Starting the application")
                 if server_task:
                     server_task.cancel()
                 server_task = asyncio.create_task(self._run(address))
-            if server_task.done():
-                server_task = asyncio.get_event_loop().create_future()
-
 
     async def _run(self, address, start_timeout=5):
         try:
-            with timeout(start_timeout):
+            async with timeout(start_timeout):
                 while True:
                     try:
                         server = await self.start_server(address)
@@ -206,8 +204,9 @@ class Application:
             raise SystemError("Unable to start application server")
 
         try:
-            if self.local_server.is_leader():
-                await self.local_server.role_changed.wait()
+            while self.local_server.is_leader():
+                async with self.local_server.role_changed:
+                    await self.local_server.role_changed.wait()
 
             log.warning("No longer the leader. Shutting down application")
         finally:

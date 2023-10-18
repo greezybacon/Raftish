@@ -1,7 +1,7 @@
 import asyncio
 from dataclasses import dataclass
-from itertools import count
 import os, os.path
+from typing import Callable
 
 from .exception import ApplyFailed
 from .storage import LogStorageBackend
@@ -138,9 +138,21 @@ class LogBase(list):
 
         return self.get(start)
 
-    def add_apply_callback(self, callback):
+    def since(self, index, max_entries=10):
+        earliest = self.start_index - 1
+        # Start at the lesser of the requested ID and the last appended index
+        # Stop at the lesser of MAX_ENTRIES from the end of the log
+        start = min(index, self.lastIndex)
+        stop = min(start + max_entries, self.lastIndex)
+        # index is 1-based, so no need to add one
+        return self[start-earliest:stop-earliest]
+        
+    def purge(self):
+        self.clear()
+
+    def set_apply_callback(self, msg_type, callback: Callable):
         assert callable(callback)
-        self.apply_callbacks.add(callback)
+        self.apply_callbacks[msg_type] = callback
 
     async def apply_up_to(self, index, max_entries=500):
         # Can't apply past the end of the local log
@@ -160,7 +172,7 @@ class LogBase(list):
             # e.g. when a new starting a cluster from disk transaction log and
             # then the first append happens (and all the logs are suddenly in
             # need of application.)
-            if self.lastApplied % 10 == 1:
+            if self.lastApplied % 10 == 9:
                 await asyncio.sleep(0)
 
         # Only keep the 1000-1500 records in memory
@@ -179,11 +191,27 @@ class LogBase(list):
             # XXX: If the apply fails for someone, then it will be resent for
             # everyone, which is probably outside the scope/intention of Raft.
             try:
-                if not all(await asyncio.gather(*(
-                        cb(entry.value)
-                        for cb in self.apply_callbacks
-                    ))):
-                    return False
+                callback = self.apply_callbacks[type(entry.value)]
+                result = await callback(entry.value)
+
+                if index in self.apply_waiters:
+                    waiter = self.apply_waiters[index]
+                    if not waiter.done():
+                        waiter.set_result(result)
+            except KeyError:
+                # Go through the types registered and see if the message type is
+                # a subclass of the registered type. If it is, then register it
+                # for the same callback and recurse
+                ev_type = type(entry.value)
+                for T, cbk in self.apply_callbacks.items():
+                    if issubclass(ev_type, T):
+                        self.set_apply_callback(ev_type, cbk)
+                        return await self.apply(index)
+
+                log.error(f"No commit handler registered for type {ev_type}")
+            except ApplyFailed:
+                log.exception(f"Error applying transaction")
+                return False
             except asyncio.CancelledError:
                 raise
             except:
@@ -194,10 +222,21 @@ class LogBase(list):
             # XXX: Timeout?
 
         # Wake up anyone awaiting a transaction application
-        self.apply_event.set()
-        self.apply_event.clear()
+        self.apply_event.notify_all()
 
         return True
+
+    async def await_apply(self, index):
+        waiter = asyncio.get_event_loop().create_future()
+        self.apply_waiters[index] = waiter
+        try:
+            return await waiter
+        finally:
+            del self.apply_waiters[index]
+
+class Commitable:
+    async def apply(self, context):
+        raise NotImplementedError
 
 @dataclass
 class LogEntry:
@@ -209,7 +248,7 @@ class LogEntry:
     in messages to other servers for application in their log.
     """
     term : int
-    value : object
+    value : Commitable
 
 
 class TransactionLog(LogBase):
@@ -243,12 +282,7 @@ class TransactionLog(LogBase):
             # Not available in the live log. Load from disk
             return self.since_from_archive(index, max_entries)
 
-        # Start at the lesser of the requested ID and the last appended index
-        # Stop at the lesser of MAX_ENTRIES from the end of the log
-        start = min(index, self.lastIndex)
-        stop = min(start + max_entries, self.lastIndex)
-        # index is 1-based, so no need to add one
-        return self[start-earliest:stop-earliest]
+        return super().since(index, max_entries)
 
     def since_from_archive(self, index, max_entries=10):
         # Disk-backed log currently always starts from 1
@@ -257,5 +291,5 @@ class TransactionLog(LogBase):
             return chunk
 
     def purge(self):
-        self.clear()
+        super().purge()
         return self.storage.purge()

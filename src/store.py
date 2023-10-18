@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 import shelve
 
 class ShelfStore:

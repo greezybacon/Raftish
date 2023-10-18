@@ -1,7 +1,9 @@
 import asyncio
 from behave import given, then, when
 from behave.api.async_step import async_run_until_complete as async_step
+from behave.api.async_step import use_or_create_async_context
 from itertools import count
+import random
 
 from raft.cluster import Cluster
 from raft.config import ClusterConfig
@@ -10,7 +12,7 @@ from raft.log import LogEntry
 @given('a cluster of {n} nodes')
 @async_step
 async def step_impl(context, n):
-    id = count(1)
+    id = count(random.randint(1, 10000000))
     port = count(10000)
     nodes = [
         {
@@ -22,8 +24,8 @@ async def step_impl(context, n):
         for _ in range(int(n))
     ]
     config = {
-        "election_timeout": 0.3,
-        "broadcast_timeout": 0.05,
+        "election_timeout": 0.4,
+        "broadcast_timeout": 0.06,
         "nodes": nodes,
     }
 
@@ -49,9 +51,9 @@ async def step_impl(context, n):
         await server.start()
 
 def shutdown_clusters(context):
-    if hasattr(context, 'clusters'):
-        for C in context.clusters:
-            C.shutdown()
+    if hasattr(context, 'servers'):
+        for S in context.servers:
+            S.shutdown()
 
 @given('a leader')
 @async_step

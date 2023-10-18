@@ -9,7 +9,6 @@ import time
 from typing import Iterable
 
 import logging
-
 log = logging.getLogger('raft.storage')
 
 class PersistenceBase:

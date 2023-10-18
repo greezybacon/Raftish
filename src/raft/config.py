@@ -2,6 +2,7 @@ import asyncio
 import json
 import os, os.path
 import shutil
+import tempfile
 
 from .exception import ConfigurationError
 
@@ -29,6 +30,11 @@ class ClusterConfig:
         self.local_id = local_id
         self.config = dict(self.default_config, **json)
         self.config_changed = asyncio.Event()
+        self._storage_location = None
+
+    def __del__(self):
+        if type(self._storage_location) is tempfile.TemporaryDirectory:
+            self._storage_location.cleanup()
 
     @classmethod
     def from_json(self, local_id, json):
@@ -61,11 +67,8 @@ class ClusterConfig:
             return self.config['storage_path']
 
         # Create and return a temporary storage location
-        path = f'/tmp/raft_node_{self.local_id}'
-        if cleanup_temp and os.path.exists(path):
-            shutil.rmtree(path)
-
-        os.makedirs(path, exist_ok=not cleanup_temp)
+        self._storage_location = tempfile.TemporaryDirectory("raft")
+        self.config['storage_path'] = path = self._storage_location.name
 
         return path
 

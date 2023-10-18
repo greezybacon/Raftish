@@ -79,6 +79,21 @@ async def kvserver(host='localhost', port=12347, db_path="/tmp/kvstore.db"):
     print(f"Listening on {host}:{port}")
     await server.serve_forever()
 
+from raft.log import Commitable
+
+@dataclass
+class KvUpdate(Commitable):
+    class Type(Enum):
+        SET = 1
+        DELETE = 2
+
+    type: Type
+    key: str
+    value: object = None
+
+    async def apply(self, store):
+        if self.type == self.Type.SET:
+            return await store.set(self.key, self.value)
 
 from raft.app import Application
 class KVStoreApp(Application):
@@ -87,7 +102,7 @@ class KVStoreApp(Application):
             self.app = app
 
         async def set(self, name, value):
-            await self.app.submit(('set', name, value))
+            await self.app.submit(KvUpdate(KvUpdate.Type.SET, name, value))
         
         def get(self, name):
             # Ensure local machine is leader and that the cluster has a quorum
@@ -107,7 +122,8 @@ class KVStoreApp(Application):
     def __init__(self, db_path=None):
         self.store = KeyValueStore(db_path)
 
-    async def commit(self, message):
+    async def commit(self, message: KvUpdate):
+        return await message.apply(self.store)
         cmd, *args = message
         if cmd == 'set':
             key, value = args
@@ -126,6 +142,8 @@ async def raft_kvserver(host='localhost', port=12347, db_path="/tmp/kvstore.db",
     app = KVStoreApp(None)
     id = count(1)
     config = {
+        "election_timeout": 0.5,
+        "heartbeat_timeout": 0.05,
         "nodes": [
             {
                 "id": (lid := next(id)),
@@ -138,6 +156,7 @@ async def raft_kvserver(host='localhost', port=12347, db_path="/tmp/kvstore.db",
     }
 
     await app.start_cluster(local_id, config=config)
+    app.local_server.log.set_apply_callback(KvUpdate, app.commit)
     await app.run((host, port))
 
 

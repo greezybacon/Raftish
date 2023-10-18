@@ -181,7 +181,7 @@ async def wait_for(aw, timeout, *, loop=None):
     async with _timeout(timeout):
         return await aw
 
-asyncio.wait_for = wait_for
+#asyncio.wait_for = wait_for
 
 @contextlib.asynccontextmanager
 async def cancelling(aws):

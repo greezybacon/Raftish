@@ -80,10 +80,13 @@ class LocalServer:
         ]
 
     def shutdown(self):
+        log.info(f"Shutting down server {self.id}")
         self.role_task.cancel()
         for task in self.comm_tasks:
             task.cancel()
-        self.socket.close()
+        if self.socket:
+            self.socket.close()
+            del self.socket
 
     # Follower Protocol ------
         
@@ -153,6 +156,8 @@ class LocalServer:
         return self.config.hasVoted
 
     def voteFor(self, term, candidate):
+        if term > self.currentTerm:
+            self.config.currentTerm = term
         assert not self.config.hasVoted
         self.config.voteFor(term, candidate)
 
@@ -176,7 +181,7 @@ class LocalServer:
     async def become_leader(self):
         await self.switch_role(LeaderRole)
     
-    def append_entry(self, entry):
+    async def append_entry(self, entry):
         if not self.is_leader():
             raise NotALeader
 
@@ -223,12 +228,15 @@ class LocalServer:
                 message, sender = await self.in_queue.get()
                 response = await self.role.handle_message(message, sender)
             except NewTermError as e:
-                if not self.is_follower():
-                    await self.switch_role(FollowerRole)
+                # TODO: Inject error into role task and await role change
                 self.config.currentTerm = e.term
+                if not self.is_follower():
+                    log.warn(f"{self.id}: Got NewTermError, becoming follower")
+                    await self.switch_role(FollowerRole)
                 # Try the response again with the new term
                 response = await self.role.handle_message(message, sender)
             except TheresAnotherLeader:
+                log.warn(f"{self.id}: Got TheresAnotherLeader, becoming follower")
                 await self.switch_role(FollowerRole)
             except asyncio.CancelledError:
                 break
@@ -238,6 +246,8 @@ class LocalServer:
             if response:
                 response.set_id(message)
                 await self.out_queue.put((response, sender))
+            else:
+                raise DeadlockError("Did not send response for message")
 
 class LocalState:
     """
@@ -256,7 +266,7 @@ class LocalState:
     def load(self):
         try:
             with open(self.disk_path, 'rb') as config_file:
-                log.info("Recovering saved state from disk")
+                log.info(f"Recovering saved state from {self.disk_path}")
                 self._config = pickle.load(config_file)
         except (FileNotFoundError, EOFError):
             self._config = self.PersistentState()

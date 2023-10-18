@@ -75,11 +75,8 @@ class StoreClient:
 
 async def kvclient(host='localhost', port=12347):
     reader, writer = await asyncio.open_connection(host or 'localhost', port)
-    try:
-        handler = StoreClient(server=(reader, writer))
-        await handler.cmdloop()
-    except:
-        raise
+    handler = StoreClient(server=(reader, writer))
+    await handler.cmdloop()
 
 
 ### Command-line interface to run the clients
