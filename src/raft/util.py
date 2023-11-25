@@ -194,11 +194,8 @@ async def cancelling(aws):
         yield aws
     finally:
         for x in aws:
-            log.info("Exiting `cancelling`")
             if not x.done():
                 x.cancel()
-                await x
-            log.info("Exited `cancelling`")
 
 class BroadcastEvent(asyncio.Event):
     def notify_all(self):

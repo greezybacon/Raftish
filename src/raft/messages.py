@@ -151,6 +151,52 @@ class AppendEntries(Message):
         return self.Response(term=server.currentTerm, success=success,
             matchIndex=server.log.lastIndex)
 
+
+@dataclass
+class InstallSnapshot(Message):
+    term: int
+    leaderId: str
+    lastIncludedIndex: int
+    lastIncludedTerm: int
+    offset: int
+    data: bytes
+    done: bool = False
+
+    @dataclass
+    class Response(Response):
+        term: int
+        success: bool
+
+    async def handle(self, server, sender) -> Response:
+        if self.leaderId not in server.cluster.remote_server_ids:
+            return
+
+        if self.term > server.currentTerm:
+            raise NewTermError(self.term)
+
+        if self.term < server.currentTerm:
+            # Reject the message
+            return self.Response(term=server.currentTerm, success=False)
+
+        if not server.is_follower():
+            raise TheresAnotherLeader()
+
+        if self.offset == 0:
+            server.application._sst = await server.application.set_state()
+            await server.application._sst.asend(None)
+
+        success = await server.application._sst.asend((self.data, self.offset))
+
+        if success and self.done:
+            log.info(f"Completed state transfer. Resetting log file to {self.lastIncludedIndex}, {self.lastIncludedTerm}")
+            # TODO: Reset the log file to the tip of the SST so the normal log
+            # sync mechanism can continue from here.
+            await server.application._sst.aclose()
+            server.log.reset(self.lastIncludedIndex, self.lastIncludedTerm)
+
+        return self.Response(term=server.currentTerm, success=success)
+
+
 class WaitList(dict):
     """
     Simple object to be used by the RemoteServer instances to await a response

@@ -177,7 +177,8 @@ class LogStorageBackend(PersistenceBase):
                 last_chunk = next(self.load(starting - offset))
         else:
             # New chunk
-            start_offset = os.path.getsize(self.fullpath)
+            start_offset = os.path.getsize(self.fullpath) \
+                if os.path.exists(self.fullpath) else 0
 
         # Write the chunks starting as requested
         chunks = chunkize(transactions, chunk_size, chunk_size - offset)
@@ -268,9 +269,9 @@ class LogStorageBackend(PersistenceBase):
     def purge(self):
         file_path = self.fullpath
         if os.path.exists(file_path):
-            os.unlink(file_path)
+            os.truncate(file_path, 0)
         if os.path.exists(file_path + '.dir'):
-            os.unlink(file_path + '.dir')
+            os.truncate(file_path + '.dir', 0)
         self.wal.clear()
 
 def chunkize(iterable, chunk_size, first_chunk_size=None):
@@ -458,6 +459,8 @@ class WriteAheadLog(list):
                 except asyncio.TimeoutError:
                     if len(self):
                         await self.replay_and_clear(backend)
+            except KeyboardInterrupt:
+                raise
             except asyncio.CancelledError:
                 break
             except:

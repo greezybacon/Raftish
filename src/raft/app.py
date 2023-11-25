@@ -66,7 +66,7 @@ class Application:
         self.clients = []
         self.cluster = cluster
         self.local_server = cluster.local_server
-        await self.local_server.start()
+        await self.local_server.start(self)
 
     @property
     def has_quorum(self):

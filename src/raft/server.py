@@ -47,6 +47,9 @@ class LocalServer:
         self.role_changed = asyncio.Condition()
         self.role_change_request = asyncio.Queue(maxsize=1)
 
+        # Hooks
+        self.application = None
+
     @property
     def id(self):
         return self._id
@@ -58,7 +61,7 @@ class LocalServer:
     def load_config(self, path):
         self.config = LocalState(path)
 
-    async def start(self):
+    async def start(self, application=None):
         # Load the log from disk
         await self.log.load()
 
@@ -78,6 +81,9 @@ class LocalServer:
             asyncio.create_task(self.send_messages()),
             asyncio.create_task(self.handle_messages())
         ]
+
+        # Connect the application for cooperation with state snapshot transfer
+        self.application: 'Application' = application
 
     def shutdown(self):
         log.info(f"Shutting down server {self.id}")
@@ -137,6 +143,8 @@ class LocalServer:
                 self.config.currentTerm = e.term
             except asyncio.CancelledError:
                 break
+            except KeyboardInterrupt:
+                raise
             except:
                 log.exception("Critical error in server role. Reverting to Follower")
                 next_role = FollowerRole
@@ -204,19 +212,31 @@ class LocalServer:
 
     async def send_messages(self):
         while True:
-            message, dest_addr = await self.out_queue.get()
-            await message.send(self.socket, dest_addr)
+            try:
+                while True:
+                    message, dest_addr = await self.out_queue.get()
+                    await message.send(self.socket, dest_addr)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                break
+            except:
+                log.exception("Unexpected error handing outbox")
         
     async def receive_messages(self):
         while True:
-            message, sender = await self.socket.recv()
-            message = Message.from_bytes(message)
-            if isinstance(message, Response):
-                # Looks like a response. See if a message is waiting on it.
-                self.wait_list.set_response(message)
-            else:
-                # Message is a request for the local server node
-                await self.in_queue.put((message, sender))
+            try:
+                while True:
+                    message, sender = await self.socket.recv()
+                    message = Message.from_bytes(message)
+                    if isinstance(message, Response):
+                        # Looks like a response. See if a message is waiting on it.
+                        self.wait_list.set_response(message)
+                    else:
+                        # Message is a request for the local server node
+                        await self.in_queue.put((message, sender))
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                break
+            except:
+                log.exception("Unexpected error handing inbox")
             
     async def handle_messages(self):
         # Messages will be handled here when the server is a follower. In
@@ -240,6 +260,8 @@ class LocalServer:
                 await self.switch_role(FollowerRole)
             except asyncio.CancelledError:
                 break
+            except KeyboardInterrupt:
+                raise
             except:
                 log.exception("Trouble handling message")
 

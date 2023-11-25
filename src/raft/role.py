@@ -2,8 +2,9 @@ import asyncio
 import random
 import time
 
-from .exception import NewTermError, TheresAnotherLeader
-from .util import BroadcastEvent
+from .exception import NewTermError, StateTransferNeeded, TheresAnotherLeader
+from .log import SnapshotCapable
+from .util import cancelling
 
 import logging
 log = logging.getLogger('raft.role')
@@ -45,7 +46,7 @@ class FollowerRole(Role):
             return CandidateRole
 
     async def handle_message(self, message: 'Message', sender):
-        if type(message) in (AppendEntries,):
+        if type(message) in (AppendEntries, InstallSnapshot):
             self.got_message.set()
 
         return await super().handle_message(message, sender)
@@ -92,7 +93,7 @@ class CandidateRole(Role):
 
         try:
             constituants = [
-                self.request_vote(server)
+                asyncio.ensure_future(self.request_vote(server))
                 for server in self.local_server.cluster.remote_servers
             ]
             for request in asyncio.as_completed(constituants, timeout=wait_time):
@@ -112,6 +113,10 @@ class CandidateRole(Role):
             # Continue with the votes we collected (probably not enough
             # though..). But cancel the remaining vote requests first
             pass
+        finally:
+            for c in constituants:
+                if not c.done():
+                    c.cancel()
 
         # Return the results of the vote
         return votes
@@ -155,35 +160,46 @@ class LeaderRole(Role):
         # Watch the synchronization events and update the local server
         # commitIndex when the cluster reaches concensus on the appending of the
         # LogEntries.
-
-        server_sync_tasks = [
+        async with cancelling(
             self.sync_server(server)
             for server in local.cluster.remote_servers
-        ]
+        ) as sync_tasks:
+            while True:
+                # Also wait for exceptions from any of the sync tasks
+                try:
+                    await asyncio.wait((
+                        self.sync_event.wait(),
+                        *sync_tasks
+                    ), return_when=asyncio.FIRST_COMPLETED)
+                    self.sync_event.clear()
+                except KeyboardInterrupt:
+                    raise
+                except asyncio.CancelledError:
+                    break
+                except:
+                    log.exception("Received unexpected error in leader sync; restarting")
+                    return LeaderRole
 
-        while True:
-            # Also wait for exceptions from any of the sync tasks
-            try:
-                await asyncio.wait((
-                    self.sync_event.wait(),
-                    *server_sync_tasks
-                ), return_when=asyncio.FIRST_COMPLETED)
-                self.sync_event.clear()
-            except asyncio.CancelledError:
-                break
-            except:
-                log.exception("Received unexpected error in leader sync; restarting")
-                return LeaderRole
-
-            # Advance the commitIndex; however, only items in the
-            # current leader's term can be used to advance the commit
-            # index. Once advanced. Then all previous entries are also
-            # committed.
-            if len(local.log):
-                if local.currentTerm == local.log.lastEntry.term:
-                    await local.advanceCommitIndex(local.cluster.lastCommitIndex())
+                # Advance the commitIndex; however, only items in the
+                # current leader's term can be used to advance the commit
+                # index. Once advanced. Then all previous entries are also
+                # committed.
+                if len(local.log):
+                    if local.currentTerm == local.log.lastEntry.term:
+                        await local.advanceCommitIndex(local.cluster.lastCommitIndex())
 
     async def sync_server(self, server: 'RemoteServer'):
+        # First try to send log entries. If not possible, then send a state
+        # transfer
+        while True:
+            try:
+                await self.send_log_entries(server)
+            except StateTransferNeeded:
+                log.info(f"{server.id}: Local log has been truncated. Sending state snapshot")
+                await self.send_state_snapshot(server)
+                log.info(f"{server.id}: Snapshot send completed. Resuming log shipping")
+
+    async def send_log_entries(self, server: 'RemoteServer'):
         """
         Remote server (follower) synchronization protocol.
 
@@ -252,6 +268,11 @@ class LeaderRole(Role):
                 log.error(f"Got unexpected message type {type(response)}: {response}")
                 continue
 
+            if nextIndex < local.log.start_index:
+                # Server requires log entries previous to the earliest in the
+                # local log. State snapshot required
+                raise StateTransferNeeded()
+
             # Handle returning from lost messages
             if server.state.lostMessages > 10:
                 # This is the first message after missing several
@@ -291,6 +312,69 @@ class LeaderRole(Role):
             except asyncio.TimeoutError:
                 pass
 
+    async def send_state_snapshot(self, server: 'RemoteServer'):
+        local = self.local_server
+        assert isinstance(local.application, SnapshotCapable)
+        snapshot = local.application.get_state()
+        heartbeat_time = self.heartbeat_time
+        max_heartbeat_time = heartbeat_time * 2
+
+        lastTerm = local.currentTerm
+        lastIndex = local.log.lastIndex
+        lastEntry = local.log.lastEntry
+
+        blocksize = 1024
+        done = False
+        block = None
+        success = False
+
+        # Prime the generator
+        await snapshot.asend(None)
+        while True:
+            # Fetch a list of entries AFTER (not including) the previous
+            # entry
+            try:
+                if success or not block:
+                    offset, block = await snapshot.asend(blocksize)
+            except StopAsyncIteration:
+                done = True
+                block = b''
+
+            try:
+                response: InstallSnapshot.Response = await server.transceive(
+                    InstallSnapshot(
+                        term=local.currentTerm,
+                        leaderId=local.id,
+                        # Note that ::since gives items AFTER this mark
+                        lastIncludedIndex=lastIndex,
+                        lastIncludedTerm=lastEntry.term,
+                        offset=offset,
+                        data=block,
+                        done=done,
+                    ),
+                    timeout=heartbeat_time
+                )
+            except asyncio.TimeoutError:
+                # Maybe the message was too long?
+                blocksize = max(256, blocksize * 0.75)
+                heartbeat_time = min(heartbeat_time * 1.05, max_heartbeat_time)
+                success = False
+                continue
+
+            if type(response) is not InstallSnapshot.Response:
+                log.error(f"Got unexpected message type {type(response)}: {response}")
+                continue
+
+            if not (success := response.success):
+                # Maybe retry with some edits?
+                continue
+
+            # Reset block size
+            blocksize = 1024
+
+            if done:
+                break
+
 # Circular dependency imports
 from .server import LocalServer, RemoteServer
-from .messages import AppendEntries, RequestVote
+from .messages import AppendEntries, RequestVote, InstallSnapshot

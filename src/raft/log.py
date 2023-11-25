@@ -1,7 +1,7 @@
 import asyncio
 from dataclasses import dataclass
 import os, os.path
-from typing import Callable
+from typing import Callable, AsyncIterator, AsyncGenerator, Tuple
 
 from .exception import ApplyFailed
 from .storage import LogStorageBackend
@@ -150,6 +150,17 @@ class LogBase(list):
     def purge(self):
         self.clear()
 
+    def reset(self, start_index: int, term: int):
+        """
+        Reset the log file after a state snapshot transfer. Will clear out any
+        persistent storage and prepare for further appending after the received
+        snapshot.
+        """
+        self.purge()
+        self.start_index = start_index
+        self.lastApplied = start_index
+        super().append(LogEntry(term=term, value=NoopEntry()))
+
     def set_apply_callback(self, msg_type, callback: Callable):
         assert callable(callback)
         self.apply_callbacks[msg_type] = callback
@@ -234,9 +245,38 @@ class LogBase(list):
         finally:
             del self.apply_waiters[index]
 
+    def snapshot_source(self, source: 'SnapshotCapable'):
+        pass
+
+
+class SnapshotCapable:
+    async def get_state(self) -> AsyncGenerator[Tuple[int, bytes], int]:
+        """
+        The local server will call this method to acquire a state snapshot of
+        the local system in order to send to other Raft connected servers. This
+        snapshot is necessary if the log files have been truncated and a new
+        server comes online and needs to start syncing before the first entry in
+        the server's log.
+
+        Caveats:
+        This should return a view of the application store so that transcations
+        could continue while the state transfer is in process.  Otherwise, it
+        should block calls the `commit` method until the state transfer is
+        complete
+        """
+        raise NotImplementedError
+
+    async def set_state(self) -> AsyncGenerator[Tuple[int, bytes], bool]:
+        raise NotImplementedError
+
+
 class Commitable:
     async def apply(self, context):
         raise NotImplementedError
+
+class NoopEntry(Commitable):
+    def apply(self, context):
+        pass
 
 @dataclass
 class LogEntry:
@@ -289,6 +329,8 @@ class TransactionLog(LogBase):
         # Just return the first chunk. count is max here--not a requirement
         for chunk in self.storage.load_partial(count=max_entries, starting=index):
             return chunk
+
+        return []
 
     def purge(self):
         super().purge()

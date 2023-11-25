@@ -1,28 +1,7 @@
 import asyncio
-from urllib import request
 
-async def gettime(host=None, port=12345):
-    reader, writer = await asyncio.open_connection(host or 'localhost', port)
-    time = await reader.readline()
-    time = time.decode('utf-8').rstrip()
-    print('Current time is:', time)
+from .message import send_message, receive_message
 
-from message import send_message, receive_message
-
-async def echo(host='localhost', port=12346):
-    reader, writer = await asyncio.open_connection(host or 'localhost', port)
-    while True:
-        try:
-            message = input('Say > ')
-            if not message:
-                break
-            send_message(writer, message)
-            print('Received >', await receive_message(reader))
-        except (EOFError, KeyboardInterrupt):
-            break
-
-import pickle
-    
 class StoreClient:
     intro = "Welcome to the key-value storage system"
     prompt = "(kv) "
@@ -81,16 +60,14 @@ async def kvclient(host='localhost', port=12347):
 
 ### Command-line interface to run the clients
 
-clients = {
-    'time': gettime,
-    'echo': echo,
-    'kv': kvclient,
-}
-
 import argparse
-parser = argparse.ArgumentParser("RAFT :: Warmup Exercise")
-parser.add_argument("client", choices=clients.keys())
+parser = argparse.ArgumentParser("RAFT :: Key-Value Store Application Client")
+
+parser.add_argument("--port", help="Application listening port", type=int, default=12347)
+parser.add_argument("--raft-port", help="Base listen port for Raft. The local-id is added to the port", type=int)
 
 if __name__ == '__main__':
     args = parser.parse_args()
-    asyncio.run(clients[args.client]())
+    import uvloop
+    uvloop.install()
+    asyncio.run(kvclient(port=args.port))
